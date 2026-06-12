@@ -1,0 +1,5 @@
+# Git LFS: track large files for push
+bfm/data/**/*.pkl filter=lfs diff=lfs merge=lfs -text
+
+bfm/data/lafan_29dof.pkl filter=lfs diff=lfs merge=lfs -text
+bfm/data/lafan_29dof_10s-clipped.pkl filter=lfs diff=lfs merge=lfs -text

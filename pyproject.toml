@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "motivo-isaac"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "==3.10.*"
+dependencies = [
+    "easydict>=1.13",
+    "exca>=0.2.5",
+    "hf-xet>=1.1.2",
+    "huggingface-hub>=0.30.2",
+    "humenv",
+    "hydra-core>=1.2.0",
+    "isaaclab[all,isaacsim]==2.0.2; sys_platform == 'linux'",
+    "isaacsim[all,extscache]==4.5.0; sys_platform == 'linux'",
+    "joblib>=1.4.2",
+    "loguru>=0.7.3",
+    "lxml>=5.3.2",
+    "mediapy>=1.2.3",
+    "ml-collections>=1.1.0",
+    "mujoco>=3.3.1",
+    "notebook>=7.4.2",
+    "numpy-stl>=3.2.0",
+    "onnx>=1.16.1",
+    "onnxruntime>=1.22.0",
+    "open3d>=0.19.0",
+    "pot>=0.9.5",
+    "pydantic>=2.11.3",
+    "rich>=14.0.0",
+    "safetensors>=0.5.3",
+    "tensordict>=0.8.3",
+    "termcolor>=3.0.1",
+    "torch>=2.5.0",
+    "tyro>=0.9.18",
+    "xxhash>=3.5.0",
+]
+
+[[tool.uv.index]]
+url = "https://pypi.nvidia.com/"
+
+# [project.optional-dependencies]
+# sim2real = [
+#     "unitree-sdk2py",
+#     "loop-rate-limiters>=1.1.0",
+#     "sshkeyboard>=2.3.1",
+#     "pygame>=2.0.0",
+# ]
+
+[tool.uv.sources]
+# unitree-sdk2py = { path = "unitree_sdk2_python", editable = true }
+humenv = { git = "https://github.com/facebookresearch/humenv.git" }
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+bfm = ["config/**/*", "data/**/*"]
+
+[tool.setuptools.packages.find]
+include = ["bfm*"]
+
+[tool.uv]
+dev-dependencies = [
+    "ruff==0.9.6",
+]
+index-strategy = "unsafe-best-match"
+
+[tool.ruff]
+line-length = 140
+extend-exclude = ["wandb"]
+
+[tool.ruff.lint]
+# E402: imports at the top of the files (but lazy import is useful to reduce memory use)
+# E731: Do not assign lambdas (but these are handy for functional programming, and used in tests to change logic)
+ignore = ["E402", "E731"]
+# Add import sorting to the linting
+extend-select = ["I"] # This is disabled as currently it causes different results on github and locally
