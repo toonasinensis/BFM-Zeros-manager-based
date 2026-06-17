@@ -12,16 +12,10 @@ import numpy as np
 import torch
 from torch.utils._pytree import tree_map
 
-import bfm
 from bfm.agents.fb.model import FBModel
 from bfm.agents.fb_cpr.model import FBcprModel
 from bfm.agents.fb_cpr_aux.model import FBcprAuxModel
-from bfm.manager_envs.g1.spec import BFMZERO_ROBOT_CONFIG
-
-if getattr(bfm, "__file__", None) is not None:
-    BFM_DIR = Path(bfm.__file__).parent
-else:
-    BFM_DIR = Path(__file__).resolve().parent
+from bfm.manager_envs.g1.spec import BFMZERO_DEFAULT_MOTION_FILE, BFMZERO_ROBOT_CONFIG, resolve_repo_path
 
 DEFAULT_MODEL_FOLDER = Path("/home/thl/wt_wbc/BFM-Zero/results/results/bfmzero-isaac1")
 MODEL_NAME_TO_CLASS = {
@@ -47,12 +41,10 @@ def _resolve_motion_file(model_folder: Path, data_path: Path | None) -> Path:
             config = json.load(f)
         configured = config.get("env", {}).get("lafan_tail_path")
         if configured:
-            path = Path(configured)
-            if not path.is_absolute():
-                path = Path.cwd() / path
+            path = resolve_repo_path(configured)
             if path.exists():
-                return path.resolve()
-    return (BFM_DIR / "data" / "lafan_29dof_10s-clipped.pkl").resolve()
+                return path
+    return resolve_repo_path(BFMZERO_DEFAULT_MOTION_FILE)
 
 
 def _resolve_robot_config(model_folder: Path, robot_config: str | None) -> str:
