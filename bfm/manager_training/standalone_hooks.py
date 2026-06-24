@@ -91,11 +91,14 @@ class EvaluationHook(TrainHook):
         if not self._should_eval(ctx.timestep, ctx):
             self._mark_current_transition_for_next_eval(ctx)
             return
+        episode_length_buf = None
+        if self.use_shared_train_env:
+            episode_length_buf = ctx.runtime.train_env.episode_length_buf.detach().clone()
         eval_metrics = self._run_eval(ctx)
         ctx.state.last_eval_metrics = eval_metrics
         self.checker.update_last_step(ctx.timestep)
         if self.use_shared_train_env:
-            ctx.reset_rollout_state()
+            ctx.reset_rollout_state(episode_length_buf=episode_length_buf)
         if ctx.cfg.prioritization:
             self._apply_prioritization(ctx, eval_metrics)
         self._mark_current_transition_for_next_eval(ctx)

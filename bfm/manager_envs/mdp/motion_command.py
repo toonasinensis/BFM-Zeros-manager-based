@@ -2,16 +2,16 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import MISSING
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import torch
 from isaaclab.assets import Articulation
 from isaaclab.managers import CommandTerm, CommandTermCfg
 from isaaclab.utils import configclass
 
-from .motion_provider import BFMZeroMotionProvider, xyzw_to_wxyz
-from .spec import BFMZERO_DEFAULT_MOTION_FILE, BFMZERO_ROBOT_CONFIG, BFMZeroG1Spec, load_bfmzero_g1_spec
-from bfm.utils.torch_utils import quat_from_angle_axis, quat_mul
+from .motion_provider import BFMZeroMotionProvider
+from .spec import BFMZERO_BASE_ANG_VEL_OBS_SCALE, BFMZERO_DEFAULT_MOTION_FILE, BFMZeroRobotSpec
+from bfm.utils.torch_utils import quat_from_angle_axis, quat_mul, xyzw_to_wxyz
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -22,13 +22,14 @@ class BFMZeroMotionCommand(CommandTerm):
 
     def __init__(self, cfg: "BFMZeroMotionCommandCfg", env: "ManagerBasedRLEnv"):
         super().__init__(cfg, env)
-        self.spec: BFMZeroG1Spec = load_bfmzero_g1_spec(cfg.robot_config)
+        self.spec: BFMZeroRobotSpec = cfg.load_robot_spec(cfg.robot_config)
         self.robot: Articulation = env.scene[cfg.asset_name]
         self.provider = BFMZeroMotionProvider(
             motion_file=cfg.motion_file,
             spec=self.spec,
             num_envs=self.num_envs,
             device=self.device,
+            base_ang_vel_obs_scale=cfg.base_ang_vel_obs_scale,
         )
         self.local_motion_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.global_motion_ids = torch.full(
@@ -171,7 +172,7 @@ class BFMZeroMotionCommand(CommandTerm):
         state = self.current_motion_state(env_ids)
         root_state = self.robot.data.default_root_state[env_ids].clone()
         root_pos = state["root_pos"]
-        root_rot_xyzw = state["root_rot"]
+        root_rot_xyzw = state["root_rot_xyzw"]
         if apply_lie_down:
             root_pos, root_rot_xyzw = self._apply_lie_down_init(root_pos, root_rot_xyzw)
         root_state[:, :3] = root_pos + self._env.scene.env_origins[env_ids]
@@ -239,12 +240,14 @@ class BFMZeroMotionCommandCfg(CommandTermCfg):
     resampling_time_range: tuple[float, float] = (1.0e9, 1.0e9)
     asset_name: str = MISSING
     motion_file: str = BFMZERO_DEFAULT_MOTION_FILE
-    robot_config: str = BFMZERO_ROBOT_CONFIG
+    robot_config: str = MISSING
+    load_robot_spec: Callable[[str], BFMZeroRobotSpec] = MISSING
     default_motion_id: int = 0
     reset_robot_state: bool = True
     loop_motion: bool = False
     training_randomize_motions: bool = False
     training_max_num_seqs: int | None = None
     training_truncate_time: float | None = None
+    base_ang_vel_obs_scale: float | None = BFMZERO_BASE_ANG_VEL_OBS_SCALE
     lie_down_init_prob: float = 0.0
     lie_down_root_height: float = 0.5

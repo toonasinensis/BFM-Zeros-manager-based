@@ -6,8 +6,6 @@ from typing import Any
 
 from omegaconf import OmegaConf
 
-BFMZERO_NO_HEAD_ROBOT_CONFIG = "g1/g1_29dof_hard_waist_no_head"
-BFMZERO_ROBOT_CONFIG = BFMZERO_NO_HEAD_ROBOT_CONFIG
 BFM_PACKAGE_NAME = "bfm"
 LEGACY_PACKAGE_NAME = "humanoidverse"
 
@@ -24,20 +22,18 @@ BFMZERO_HISTORY_CONFIG = {
     "actions": 4,
 }
 BFMZERO_HISTORY_ORDER = tuple(sorted(BFMZERO_HISTORY_CONFIG))
-BFMZERO_BASE_ANG_VEL_OBS_SCALE = 0.25
+BFMZERO_BASE_ANG_VEL_OBS_SCALE = 1.0
 
 
 @dataclass(frozen=True)
-class BFMZeroG1Spec:
+class BFMZeroRobotSpec:
+    """Common robot contract used by the manager MDP/motion code."""
+
     config_name: str
     bfm_dir: Path
     dof_names: tuple[str, ...]
     body_names: tuple[str, ...]
     motion_body_names: tuple[str, ...]
-    extend_body_names: tuple[str, ...]
-    extend_parent_names: tuple[str, ...]
-    extend_pos: tuple[tuple[float, float, float], ...]
-    extend_rot_wxyz: tuple[tuple[float, float, float, float], ...]
     default_joint_angles: dict[str, float]
     effort_limits: tuple[float, ...]
     velocity_limits: tuple[float, ...]
@@ -57,8 +53,6 @@ class BFMZeroG1Spec:
     motion_urdf_file_name: str
     torso_name: str
     foot_name: str
-    left_ankle_dof_names: tuple[str, ...]
-    right_ankle_dof_names: tuple[str, ...]
     penalize_contacts_on: tuple[str, ...]
     randomize_link_body_names: tuple[str, ...]
     num_bodies: int
@@ -69,7 +63,7 @@ class BFMZeroG1Spec:
 
     @property
     def observation_body_names(self) -> tuple[str, ...]:
-        return self.motion_body_names + self.extend_body_names
+        return self.motion_body_names
 
     @property
     def default_joint_pos(self) -> tuple[float, ...]:
@@ -126,11 +120,14 @@ def resolve_repo_path(path: str | Path, *, bfm_dir: Path | None = None) -> Path:
     return repo_root / path
 
 
-def _as_tuple(values: Any, cast=float) -> tuple:
+def as_tuple(values: Any, cast=float) -> tuple:
     return tuple(cast(value) for value in values)
 
 
-def _load_robot_config(config_name: str = BFMZERO_ROBOT_CONFIG):
+_as_tuple = as_tuple
+
+
+def load_robot_config(config_name: str):
     bfm_dir = get_bfm_dir()
     config_dir = bfm_dir / "config"
     robot_base = OmegaConf.load(config_dir / "robot" / "robot_base.yaml")
@@ -138,57 +135,53 @@ def _load_robot_config(config_name: str = BFMZERO_ROBOT_CONFIG):
     return OmegaConf.merge(robot_base, robot_cfg)
 
 
-def load_bfmzero_g1_spec(config_name: str = BFMZERO_ROBOT_CONFIG) -> BFMZeroG1Spec:
-    cfg = _load_robot_config(config_name)
-    robot = cfg.robot
-    bfm_dir = get_bfm_dir()
+_load_robot_config = load_robot_config
+
+
+def robot_spec_kwargs(config_name: str, robot: Any, *, bfm_dir: Path | None = None) -> dict[str, Any]:
+    bfm_dir = bfm_dir or get_bfm_dir()
 
     asset_root = resolve_repo_path(robot.asset.asset_root, bfm_dir=bfm_dir)
     motion_asset_root = resolve_repo_path(robot.motion.asset.assetRoot, bfm_dir=bfm_dir)
     usd_path = asset_root / robot.asset.usd_file
     mjcf_path = motion_asset_root / robot.motion.asset.assetFileName
 
-    extend_cfg = list(robot.motion.get("extend_config", []))
-    return BFMZeroG1Spec(
-        config_name=config_name,
-        bfm_dir=bfm_dir,
-        dof_names=_as_tuple(robot.dof_names, str),
-        body_names=_as_tuple(robot.body_names, str),
-        motion_body_names=_as_tuple(robot.motion.body_names, str),
-        extend_body_names=tuple(str(item.joint_name) for item in extend_cfg),
-        extend_parent_names=tuple(str(item.parent_name) for item in extend_cfg),
-        extend_pos=tuple(tuple(float(x) for x in item.pos) for item in extend_cfg),
-        extend_rot_wxyz=tuple(tuple(float(x) for x in item.rot) for item in extend_cfg),
-        default_joint_angles={str(k): float(v) for k, v in robot.init_state.default_joint_angles.items()},
-        effort_limits=_as_tuple(robot.dof_effort_limit_list, float),
-        velocity_limits=_as_tuple(robot.dof_vel_limit_list, float),
-        armatures=_as_tuple(robot.dof_armature_list, float),
-        joint_frictions=_as_tuple(robot.dof_joint_friction_list, float),
-        stiffness_by_key={str(k): float(v) for k, v in robot.control.stiffness.items()},
-        damping_by_key={str(k): float(v) for k, v in robot.control.damping.items()},
-        action_scale=float(robot.control.action_scale),
-        action_clip_value=float(robot.control.action_clip_value),
-        normalize_action_to=float(robot.control.normalize_action_to),
-        normalize_action_from=float(robot.control.normalize_action_from),
-        action_rescale=bool(robot.control.action_rescale),
-        usd_path=usd_path,
-        mjcf_path=mjcf_path,
-        motion_asset_root=motion_asset_root,
-        motion_asset_file_name=str(robot.motion.asset.assetFileName),
-        motion_urdf_file_name=str(robot.motion.asset.urdfFileName),
-        torso_name=str(robot.torso_name),
-        foot_name=str(robot.foot_name),
-        left_ankle_dof_names=_as_tuple(robot.left_ankle_dof_names, str),
-        right_ankle_dof_names=_as_tuple(robot.right_ankle_dof_names, str),
-        penalize_contacts_on=_as_tuple(robot.penalize_contacts_on, str),
-        randomize_link_body_names=_as_tuple(robot.get("randomize_link_body_names", robot.body_names), str),
-        num_bodies=int(robot.num_bodies),
-    )
+    motion_body_names = robot.motion.get("body_names", robot.body_names)
+
+    return {
+        "config_name": config_name,
+        "bfm_dir": bfm_dir,
+        "dof_names": as_tuple(robot.dof_names, str),
+        "body_names": as_tuple(robot.body_names, str),
+        "motion_body_names": as_tuple(motion_body_names, str),
+        "default_joint_angles": {str(k): float(v) for k, v in robot.init_state.default_joint_angles.items()},
+        "effort_limits": as_tuple(robot.dof_effort_limit_list, float),
+        "velocity_limits": as_tuple(robot.dof_vel_limit_list, float),
+        "armatures": as_tuple(robot.dof_armature_list, float),
+        "joint_frictions": as_tuple(robot.dof_joint_friction_list, float),
+        "stiffness_by_key": {str(k): float(v) for k, v in robot.control.stiffness.items()},
+        "damping_by_key": {str(k): float(v) for k, v in robot.control.damping.items()},
+        "action_scale": float(robot.control.action_scale),
+        "action_clip_value": float(robot.control.action_clip_value),
+        "normalize_action_to": float(robot.control.normalize_action_to),
+        "normalize_action_from": float(robot.control.normalize_action_from),
+        "action_rescale": bool(robot.control.action_rescale),
+        "usd_path": usd_path,
+        "mjcf_path": mjcf_path,
+        "motion_asset_root": motion_asset_root,
+        "motion_asset_file_name": str(robot.motion.asset.assetFileName),
+        "motion_urdf_file_name": str(robot.motion.asset.urdfFileName),
+        "torso_name": str(robot.torso_name),
+        "foot_name": str(robot.foot_name),
+        "penalize_contacts_on": as_tuple(robot.penalize_contacts_on, str),
+        "randomize_link_body_names": as_tuple(robot.get("randomize_link_body_names", robot.body_names), str),
+        "num_bodies": int(robot.num_bodies),
+    }
 
 
-def assert_bfmzero_spec_consistent(spec: BFMZeroG1Spec) -> None:
-    if spec.num_actions != 29:
-        raise AssertionError(f"Expected 29 BFM-Zero actions, got {spec.num_actions}.")
+def assert_robot_spec_consistent(spec: BFMZeroRobotSpec, *, expected_num_actions: int | None = None) -> None:
+    if expected_num_actions is not None and spec.num_actions != expected_num_actions:
+        raise AssertionError(f"Expected {expected_num_actions} BFM-Zero actions, got {spec.num_actions}.")
     for name, values in {
         "effort_limits": spec.effort_limits,
         "velocity_limits": spec.velocity_limits,
@@ -199,22 +192,18 @@ def assert_bfmzero_spec_consistent(spec: BFMZeroG1Spec) -> None:
         if len(values) != spec.num_actions:
             raise AssertionError(f"{name} has length {len(values)} but dof_names has length {spec.num_actions}.")
     if spec.body_names != spec.motion_body_names:
-        raise AssertionError("BFM-Zero robot.body_names and robot.motion.body_names must stay in the same order.")
+        raise AssertionError("robot.body_names and robot.motion.body_names must stay in the same order.")
     if len(spec.body_names) != spec.num_bodies:
         raise AssertionError(
             f"robot.num_bodies={spec.num_bodies} but body_names has length {len(spec.body_names)}."
         )
-    if spec.extend_body_names not in ((), ("head_link",)):
-        raise AssertionError(f"Expected either no extend bodies or the BFM-Zero head_link extension, got {spec.extend_body_names}.")
-    if spec.extend_body_names and spec.extend_body_names != ("head_link",):
-        raise AssertionError(f"Unsupported BFM-Zero extension bodies: {spec.extend_body_names}.")
     missing_randomize_bodies = [name for name in spec.randomize_link_body_names if name not in spec.body_names]
     if missing_randomize_bodies:
         raise AssertionError(f"randomize_link_body_names contains bodies not in body_names: {missing_randomize_bodies}")
     if not spec.usd_path.is_file():
-        raise FileNotFoundError(f"BFM-Zero G1 USD not found: {spec.usd_path}")
+        raise FileNotFoundError(f"Robot USD not found: {spec.usd_path}")
     if not spec.mjcf_path.is_file():
-        raise FileNotFoundError(f"BFM-Zero motion MJCF not found: {spec.mjcf_path}")
+        raise FileNotFoundError(f"Motion MJCF not found: {spec.mjcf_path}")
 
 
 def assert_model_matches_bfmzero_contract(model: Any, obs: dict[str, Any] | None = None) -> None:
@@ -241,3 +230,21 @@ def assert_model_matches_bfmzero_contract(model: Any, obs: dict[str, Any] | None
             actual = tuple(obs[key].shape[1:])
             if actual != expected:
                 raise AssertionError(f"Observation {key!r} shape mismatch: {actual} != {expected}")
+
+__all__ = [
+    "BFMZERO_ACTOR_KEYS",
+    "BFMZERO_BACKWARD_KEYS",
+    "BFMZERO_BASE_ANG_VEL_OBS_SCALE",
+    "BFMZERO_DEFAULT_MOTION_FILE",
+    "BFMZERO_HISTORY_CONFIG",
+    "BFMZERO_HISTORY_ORDER",
+    "BFMZERO_OBS_KEYS",
+    "BFMZeroRobotSpec",
+    "as_tuple",
+    "assert_model_matches_bfmzero_contract",
+    "assert_robot_spec_consistent",
+    "get_bfm_dir",
+    "load_robot_config",
+    "resolve_repo_path",
+    "robot_spec_kwargs",
+]

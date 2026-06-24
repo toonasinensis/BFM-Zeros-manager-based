@@ -4,18 +4,26 @@ import numpy as np
 import torch
 
 from bfm.agents.buffers.trajectory import TrajectoryDictBuffer
-from bfm.manager_envs.g1.motion_provider import BFMZeroMotionProvider
-from bfm.manager_envs.g1.observations import compute_humanoid_observations_max
-from bfm.manager_envs.g1.spec import BFMZERO_HISTORY_CONFIG, BFMZERO_HISTORY_ORDER
+from bfm.manager_envs.mdp.motion_provider import BFMZeroMotionProvider
+from bfm.manager_envs.mdp.observations import compute_humanoid_observations_max
+from bfm.manager_envs.mdp.spec import BFMZERO_HISTORY_CONFIG, BFMZERO_HISTORY_ORDER
 from bfm.utils.torch_utils import quat_rotate_inverse
 
 
-def load_manager_expert_trajectories(env, agent_cfg, *, device: str = "cpu", max_num_seqs: int | None = None):
+def load_manager_expert_trajectories(
+    env,
+    agent_cfg,
+    *,
+    device: str = "cpu",
+    max_num_seqs: int | None = None,
+    base_ang_vel_obs_scale: float | None = None,
+):
     provider = BFMZeroMotionProvider(
         motion_file=env.motion_file,
         spec=env.adapter.spec,
         num_envs=env.num_envs,
         device=env.device,
+        base_ang_vel_obs_scale=base_ang_vel_obs_scale,
     )
     provider.load_for_training(max_num_seqs=max_num_seqs)
 
@@ -29,34 +37,35 @@ def load_manager_expert_trajectories(env, agent_cfg, *, device: str = "cpu", max
         file_names.append(provider.motion_lib.curr_motion_keys[local_motion_id])
 
         ref_body_pos = motion_res["rg_pos_t"]
-        ref_body_rots = motion_res["rg_rot_t"]
+        ref_body_rots_xyzw = motion_res["rg_rot_t_xyzw"]
         ref_body_vels = motion_res["body_vel_t"]
         ref_body_angular_vels = motion_res["body_ang_vel_t"]
 
         obs_dict = compute_humanoid_observations_max(
             ref_body_pos,
-            ref_body_rots,
+            ref_body_rots_xyzw,
             ref_body_vels,
             ref_body_angular_vels,
             local_root_obs=True,
             root_height_obs=True,
+            quat_format="xyzw",
         )
         privileged_state = torch.cat([value for value in obs_dict.values()], dim=-1)
 
         ref_dof_pos = motion_res["dof_pos"] - provider.default_joint_pos
         ref_dof_vel = motion_res["dof_vel"]
-        ref_ang_vel = ref_body_angular_vels[:, 0]
+        ref_base_ang_vel = ref_body_angular_vels[:, 0] * provider.base_ang_vel_obs_scale
         projected_gravity = quat_rotate_inverse(
-            ref_body_rots[:, 0],
+            ref_body_rots_xyzw[:, 0],
             provider.gravity_vec.repeat(privileged_state.shape[0], 1),
             w_last=True,
         )
-        state = torch.cat([ref_dof_pos, ref_dof_vel, projected_gravity, ref_ang_vel], dim=-1)
+        state = torch.cat([ref_dof_pos, ref_dof_vel, projected_gravity, ref_base_ang_vel], dim=-1)
         last_action = torch.zeros_like(ref_dof_pos)
 
         dims = {
             "actions": last_action.shape[-1],
-            "base_ang_vel": ref_ang_vel.shape[-1],
+            "base_ang_vel": ref_base_ang_vel.shape[-1],
             "dof_pos": ref_dof_pos.shape[-1],
             "dof_vel": ref_dof_vel.shape[-1],
             "projected_gravity": projected_gravity.shape[-1],

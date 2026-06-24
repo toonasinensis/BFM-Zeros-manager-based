@@ -143,3 +143,9 @@ def penalty_slippage(env, sensor_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg)
     foot_vel = robot.data.body_lin_vel_w[:, _body_ids(asset_cfg)]
     contact = torch.norm(contact_sensor.data.net_forces_w[:, _body_ids(sensor_cfg)], dim=-1) > 1.0
     return torch.sum(torch.norm(foot_vel, dim=-1) * contact, dim=1)
+
+
+
+def zero_reward(env) -> torch.Tensor:
+    return torch.zeros(env.num_envs, dtype=torch.float32, device=env.device)
+

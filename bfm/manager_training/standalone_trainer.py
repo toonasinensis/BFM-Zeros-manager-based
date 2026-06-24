@@ -11,16 +11,28 @@ from torch.utils._pytree import tree_map
 from tqdm import tqdm
 
 from bfm.agents.buffers.transition import dtype_numpytotorch_lower_precision
-from bfm.agents.evaluations.bfmzero_manager import BFMZeroManagerTrackingEvaluation
 from bfm.agents.misc.loggers import CSVLogger
 from bfm.agents.utils import set_seed_everywhere
 
 from .standalone_checkpoint import load_agent_or_build, load_or_create_train_buffer
 from .standalone_context import TrainContext, TrainRuntime, TrainState
-from .standalone_expert import load_manager_expert_trajectories
 from .standalone_hooks import AgentUpdateHook, CheckpointHook, EvaluationHook, HookList, TrainLogHook
 
 TRAIN_LOG_FILENAME = "train_log.txt"
+
+
+def _randomize_episode_length_buf_once(train_env) -> None:
+    episode_length_buf = train_env.episode_length_buf
+    max_episode_length = int(getattr(train_env.unwrapped, "max_episode_length", 0) or 0)
+    if max_episode_length <= 1:
+        return
+    episode_length_buf[:] = torch.randint(
+        0,
+        max_episode_length,
+        episode_length_buf.shape,
+        device=episode_length_buf.device,
+        dtype=episode_length_buf.dtype,
+    )
 
 
 class StandaloneManagerTrainer:
@@ -29,11 +41,8 @@ class StandaloneManagerTrainer:
         self.train_env, self.train_env_info = cfg.env.build(num_envs=cfg.online_parallel_envs)
         self.obs_space = self.train_env.single_observation_space
         self.action_space = self.train_env.single_action_space
-        if "time" not in self.obs_space.keys():
-            raise AssertionError("Manager observation space must contain 'time'.")
         if len(self.action_space.shape) != 1:
             raise AssertionError("Only 1D manager action space is supported.")
-        del self.obs_space.spaces["time"]
         self.action_dim = self.action_space.shape[0]
 
         print(f"Workdir: {self.cfg.work_dir}")
@@ -74,6 +83,8 @@ class StandaloneManagerTrainer:
         )
 
     def _find_prioritization_eval_name(self) -> str | None:
+        from bfm.agents.evaluations.bfmzero_manager import BFMZeroManagerTrackingEvaluation
+
         if not self.cfg.prioritization:
             return None
         for name, evaluation in self.evaluations.items():
@@ -85,11 +96,14 @@ class StandaloneManagerTrainer:
         self.train_online()
 
     def _load_expert_buffer(self):
+        from .standalone_expert import load_manager_expert_trajectories
+
         return load_manager_expert_trajectories(
             self.train_env,
             self.cfg.agent,
             device=self.cfg.buffer_device,
             max_num_seqs=self.cfg.training_max_num_seqs,
+            base_ang_vel_obs_scale=self.cfg.expert_base_ang_vel_obs_scale,
         )
 
     def _allocate_replay_buffer(self, expert_buffer):
@@ -121,6 +135,7 @@ class StandaloneManagerTrainer:
 
     def _make_context(self, replay_buffer) -> TrainContext:
         td, info = self.train_env.reset()
+        _randomize_episode_length_buf_once(self.train_env)
         runtime = TrainRuntime(
             cfg=self.cfg,
             work_dir=self.work_dir,
@@ -149,7 +164,7 @@ class StandaloneManagerTrainer:
                 lambda x: torch.tensor(x, dtype=dtype_numpytotorch_lower_precision(x.dtype), device=ctx.runtime.agent.device),
                 ctx.state.td,
             )
-            step_count = obs.pop("time")
+            step_count = train_env.episode_length_buf.unsqueeze(-1).to(device=ctx.runtime.agent.device)
             history_context = None
             ctx.state.z_context = ctx.runtime.agent.maybe_update_rollout_context(
                 z=ctx.state.z_context,

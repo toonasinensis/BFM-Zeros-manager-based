@@ -8,16 +8,6 @@ import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 
-from bfm.utils.torch_utils import quat_rotate_inverse
-
-from .motion_provider import wxyz_to_xyzw
-from .observations import compute_humanoid_observations_max
-from .spec import BFMZERO_BASE_ANG_VEL_OBS_SCALE
-
-
-def _robot(env, asset_cfg: SceneEntityCfg) -> Articulation:
-    return env.scene[asset_cfg.name]
-
 
 def _env_ids_tensor(env, env_ids, device: torch.device | str) -> torch.Tensor:
     if env_ids is None or isinstance(env_ids, slice):
@@ -41,57 +31,6 @@ def _resolve_dist_fn(distribution: Literal["uniform", "log_uniform", "gaussian"]
     raise ValueError(f"Unrecognized distribution {distribution!r}.")
 
 
-def bfmzero_default_joint_pos(env, robot: Articulation, joint_ids=None) -> torch.Tensor:
-    default_joint_pos = robot.data.default_joint_pos
-    offset = getattr(env, "bfmzero_default_dof_pos_offset", None)
-    if offset is not None:
-        default_joint_pos = default_joint_pos + offset.to(default_joint_pos.device)
-    if joint_ids is None:
-        return default_joint_pos
-    return default_joint_pos[:, joint_ids]
-
-
-def zero_reward(env) -> torch.Tensor:
-    return torch.zeros(env.num_envs, dtype=torch.float32, device=env.device)
-
-
-def bfmzero_state_obs(env, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    robot = _robot(env, asset_cfg)
-    root_quat_xyzw = wxyz_to_xyzw(robot.data.root_quat_w)
-    gravity = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32, device=env.device).reshape(1, 3).repeat(env.num_envs, 1)
-    projected_gravity = quat_rotate_inverse(root_quat_xyzw, gravity, w_last=True)
-    base_ang_vel = (
-        quat_rotate_inverse(root_quat_xyzw, robot.data.root_ang_vel_w, w_last=True)
-        * BFMZERO_BASE_ANG_VEL_OBS_SCALE
-    )
-    return torch.cat(
-        [
-            robot.data.joint_pos - bfmzero_default_joint_pos(env, robot),
-            robot.data.joint_vel,
-            projected_gravity,
-            base_ang_vel,
-        ],
-        dim=-1,
-    )
-
-
-def bfmzero_privileged_state_obs(
-    env,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    root_height_obs: bool = True,
-) -> torch.Tensor:
-    robot = _robot(env, asset_cfg)
-    body_ids = asset_cfg.body_ids if asset_cfg.body_ids is not None else slice(None)
-    obs_dict = compute_humanoid_observations_max(
-        robot.data.body_pos_w[:, body_ids],
-        wxyz_to_xyzw(robot.data.body_quat_w[:, body_ids]),
-        robot.data.body_lin_vel_w[:, body_ids],
-        robot.data.body_ang_vel_w[:, body_ids],
-        local_root_obs=True,
-        root_height_obs=root_height_obs,
-    )
-    return torch.cat([value for value in obs_dict.values()], dim=-1)
-
 
 def randomize_body_com(
     env,
@@ -101,7 +40,7 @@ def randomize_body_com(
     operation: Literal["add", "abs", "scale"],
     distribution: Literal["uniform", "log_uniform", "gaussian"] = "uniform",
 ) -> None:
-    asset = _robot(env, asset_cfg)
+    asset =  env.scene[asset_cfg.name]  
     env_ids_cpu = _env_ids_tensor(env, env_ids, "cpu")
     body_ids = _scene_entity_ids_tensor(asset, asset_cfg.body_ids, "cpu", count=asset.num_bodies)
 
@@ -135,6 +74,7 @@ def randomize_body_com(
         raise ValueError(f"Unknown COM randomization operation {operation!r}.")
     asset.root_physx_view.set_coms(coms, env_ids_cpu)
 
+ 
 
 def randomize_default_joint_pos_offset(
     env,
@@ -144,7 +84,7 @@ def randomize_default_joint_pos_offset(
     action_term_name: str = "joint_pos",
     apply_during_eval: bool = False,
 ) -> None:
-    asset = _robot(env, asset_cfg)
+    asset = env.scene[asset_cfg.name] 
     env_ids_t = _env_ids_tensor(env, env_ids, asset.device)
     joint_ids = _scene_entity_ids_tensor(asset, asset_cfg.joint_ids, asset.device, count=asset.data.joint_pos.shape[1])
 

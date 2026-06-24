@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import bfm.agents.fb_cpr_aux.agent as fb_cpr_aux_agent
-from bfm.agents.envs.bfmzero_manager_isaac import BFMZeroManagerIsaacConfig
-from bfm.agents.evaluations.bfmzero_manager import BFMZeroManagerTrackingEvaluationConfig
 from bfm.agents.fb_cpr_aux.agent import FBcprAuxAgentConfig
 from bfm.agents.fb_cpr_aux.model import FBcprAuxModelArchiConfig, FBcprAuxModelConfig
 from bfm.agents.nn_filters import DictInputFilterConfig
@@ -19,6 +17,10 @@ from bfm.agents.nn_models import (
 )
 from bfm.agents.normalizers import BatchNormNormalizerConfig, ObsNormalizerConfig
 
+if TYPE_CHECKING:
+    from bfm.agents.envs.bfmzero_manager_isaac import BFMZeroManagerIsaacConfig
+    from bfm.agents.evaluations.bfmzero_manager import BFMZeroManagerTrackingEvaluationConfig
+
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
@@ -29,6 +31,10 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _env_int(name: str, default: int) -> int:
     return int(os.environ.get(name, str(default)))
+
+
+def _env_float(name: str, default: float) -> float:
+    return float(os.environ.get(name, str(default)))
 
 
 def _env_optional_int(name: str, default: int | None) -> int | None:
@@ -78,6 +84,8 @@ class BFMZeroManagerTrainSettings:
     motion_file: str = "bfm/data/lafan_29dof_10s-clipped.pkl"
     robot_config: str = "g1/g1_29dof_hard_waist_no_head"
     max_episode_length_s: float = 10.0
+    base_ang_vel_obs_scale: float = 1.0
+    expert_base_ang_vel_obs_scale: float = 1.0
     training_randomize_motions: bool = True
     training_max_num_seqs: int | None = None
     enable_domain_randomization: bool = True
@@ -112,6 +120,11 @@ class BFMZeroManagerTrainSettings:
             disable_tqdm=_env_bool("BFMZERO_MANAGER_DISABLE_TQDM", cls.disable_tqdm),
             motion_file=_env_str("BFMZERO_MANAGER_MOTION_FILE", cls.motion_file),
             robot_config=_env_str("BFMZERO_MANAGER_ROBOT_CONFIG", cls.robot_config),
+            base_ang_vel_obs_scale=_env_float("BFMZERO_MANAGER_BASE_ANG_VEL_OBS_SCALE", cls.base_ang_vel_obs_scale),
+            expert_base_ang_vel_obs_scale=_env_float(
+                "BFMZERO_MANAGER_EXPERT_BASE_ANG_VEL_OBS_SCALE",
+                cls.expert_base_ang_vel_obs_scale,
+            ),
             training_randomize_motions=_env_bool("BFMZERO_MANAGER_RANDOMIZE_MOTIONS", cls.training_randomize_motions),
             training_max_num_seqs=_env_optional_int("BFMZERO_MANAGER_TRAINING_MAX_NUM_SEQS", cls.training_max_num_seqs),
             enable_domain_randomization=_env_bool("BFMZERO_MANAGER_ENABLE_DOMAIN_RANDOMIZATION", cls.enable_domain_randomization),
@@ -298,6 +311,7 @@ class StandaloneManagerTrainingConfig:
     eval_every_steps: int
     tags: dict[str, Any]
     training_max_num_seqs: int | None
+    expert_base_ang_vel_obs_scale: float
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
@@ -330,10 +344,14 @@ class StandaloneManagerTrainingConfig:
             "eval_every_steps": self.eval_every_steps,
             "tags": self.tags,
             "training_max_num_seqs": self.training_max_num_seqs,
+            "expert_base_ang_vel_obs_scale": self.expert_base_ang_vel_obs_scale,
         }
 
 
 def build_standalone_manager_train_config(settings: BFMZeroManagerTrainSettings) -> StandaloneManagerTrainingConfig:
+    from bfm.agents.envs.bfmzero_manager_isaac import BFMZeroManagerIsaacConfig
+    from bfm.agents.evaluations.bfmzero_manager import BFMZeroManagerTrackingEvaluationConfig
+
     if settings.prioritization and not settings.enable_eval:
         raise ValueError("prioritization=True requires enable_eval=True.")
     if not settings.compile_model:
@@ -368,6 +386,7 @@ def build_standalone_manager_train_config(settings: BFMZeroManagerTrainSettings)
             default_motion_id=0,
             training_randomize_motions=settings.training_randomize_motions,
             training_max_num_seqs=settings.training_max_num_seqs,
+            base_ang_vel_obs_scale=settings.base_ang_vel_obs_scale,
             enable_domain_randomization=settings.enable_domain_randomization,
             render_mode=None,
         ),
@@ -410,7 +429,10 @@ def build_standalone_manager_train_config(settings: BFMZeroManagerTrainSettings)
             "disable_tqdm": settings.disable_tqdm,
             "checkpoint_buffer": settings.checkpoint_buffer,
             "training_max_num_seqs": settings.training_max_num_seqs,
+            "base_ang_vel_obs_scale": settings.base_ang_vel_obs_scale,
+            "expert_base_ang_vel_obs_scale": settings.expert_base_ang_vel_obs_scale,
             "enable_domain_randomization": settings.enable_domain_randomization,
         },
         training_max_num_seqs=settings.training_max_num_seqs,
+        expert_base_ang_vel_obs_scale=settings.expert_base_ang_vel_obs_scale,
     )

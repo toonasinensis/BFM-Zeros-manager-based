@@ -11,7 +11,7 @@ from torch.utils._pytree import tree_map
 from tqdm import tqdm
 
 from bfm.agents.envs.bfmzero_manager_isaac import BFMZeroManagerIsaacConfig, BFMZeroManagerVectorEnv
-from bfm.manager_envs.g1.motion_provider import BFMZeroMotionProvider
+from bfm.manager_envs.mdp.motion_provider import BFMZeroMotionProvider
 
 from .base import BaseEvalConfig, extract_model
 

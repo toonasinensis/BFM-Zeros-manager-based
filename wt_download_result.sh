@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SSH_PORT="${SSH_PORT:-22}"
-REMOTE_HOST="${REMOTE_HOST:-xiechunyang@112.74.164.141}"
+REMOTE_HOST="${REMOTE_HOST:-xiechunyang@47.107.87.125}"
 REMOTE_BFM_ROOT="${REMOTE_BFM_ROOT:-/home/xiechunyang/wt_ws/wt_wbc/BFM-Zero-ManagerOnly}"
 LOCAL_RESULTS_ROOT="${LOCAL_RESULTS_ROOT:-/home/thl/wt_wbc/BFM-Zero-ManagerOnly/results}"
 LOCAL_REPO_ROOT="${LOCAL_REPO_ROOT:-/home/thl/wt_wbc/BFM-Zero-ManagerOnly}"

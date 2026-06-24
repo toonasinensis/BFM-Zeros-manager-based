@@ -7,18 +7,23 @@ import torch
 
 from bfm.utils.torch_utils import quat_rotate_inverse
 
-from .light_motion_lib import BFMZeroLightMotionLib
-from .observations import compute_humanoid_observations_max
-from .spec import BFMZERO_DEFAULT_MOTION_FILE, BFMZeroG1Spec, load_bfmzero_g1_spec
+from .named_npz_motion_lib import BFMZeroNamedNpzMotionLib
+from .spec import BFMZERO_BASE_ANG_VEL_OBS_SCALE, BFMZERO_DEFAULT_MOTION_FILE, BFMZeroRobotSpec
 
 
-def xyzw_to_wxyz(quat: torch.Tensor) -> torch.Tensor:
-    return quat[..., [3, 0, 1, 2]]
+def _is_named_npz_motion_path(path: Path) -> bool:
+    return path.is_dir() or path.suffix == ".npz"
 
 
-def wxyz_to_xyzw(quat: torch.Tensor) -> torch.Tensor:
-    return quat[..., [1, 2, 3, 0]]
+def _make_motion_lib(*, motion_file: Path, spec: BFMZeroRobotSpec, num_envs: int, device: torch.device):
+    if _is_named_npz_motion_path(motion_file):
+        return BFMZeroNamedNpzMotionLib(motion_file=motion_file, spec=spec, num_envs=num_envs, device=device)
+    from .light_motion_lib import BFMZeroLightMotionLib
 
+    return BFMZeroLightMotionLib(motion_file=motion_file, spec=spec, num_envs=num_envs, device=device)
+
+
+ 
 
 def finite_dict_assert(values: dict[str, torch.Tensor], *, context: str) -> None:
     bad = []
@@ -30,30 +35,33 @@ def finite_dict_assert(values: dict[str, torch.Tensor], *, context: str) -> None
 
 
 class BFMZeroMotionProvider:
-    """BFM-Zero pkl motion provider with explicit global-to-local motion ids."""
+    """BFM-Zero motion provider with explicit global-to-local motion ids."""
 
     def __init__(
         self,
         *,
         motion_file: str | Path | None = None,
-        spec: BFMZeroG1Spec | None = None,
+        spec: BFMZeroRobotSpec | None = None,
         num_envs: int = 1,
         device: str | torch.device = "cuda:0",
+        base_ang_vel_obs_scale: float | None = None,
     ):
-        self.spec = spec or load_bfmzero_g1_spec()
+        if spec is None:
+            raise ValueError("BFMZeroMotionProvider requires a robot spec from the robot config package.")
+        self.spec = spec
         self.motion_file = Path(motion_file or BFMZERO_DEFAULT_MOTION_FILE)
         self.device = torch.device(device)
         self.num_envs = int(num_envs)
-        self.motion_lib = BFMZeroLightMotionLib(
-            motion_file=self.motion_file,
-            spec=self.spec,
-            num_envs=self.num_envs,
-            device=self.device,
-        )
+        self.motion_lib = _make_motion_lib(motion_file=self.motion_file, spec=self.spec, num_envs=self.num_envs, device=self.device)
         self.current_global_motion_id: int | None = None
         self.training_motions_loaded = False
         self.default_joint_pos = torch.tensor(self.spec.default_joint_pos, dtype=torch.float32, device=self.device).reshape(1, -1)
         self.gravity_vec = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32, device=self.device).reshape(1, 3)
+        self.base_ang_vel_obs_scale = (
+            float(base_ang_vel_obs_scale)
+            if base_ang_vel_obs_scale is not None
+            else float(getattr(self.spec, "base_ang_vel_obs_scale", BFMZERO_BASE_ANG_VEL_OBS_SCALE))
+        )
 
     @property
     def local_motion_id(self) -> int:
@@ -154,11 +162,13 @@ class BFMZeroMotionProvider:
         use_root_height_obs: bool = True,
         velocity_multiplier: float = 1.0,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        from .observations import compute_humanoid_observations_max
+
         motion_times = self.control_times(global_motion_id, step_dt)
         motion_state = self.state_at_times(global_motion_id, motion_times)
 
         ref_body_pos = motion_state["rg_pos_t"]
-        ref_body_rots = motion_state["rg_rot_t"]
+        ref_body_rots_xyzw = motion_state["rg_rot_t_xyzw"]
         ref_body_vels = motion_state["body_vel_t"] * velocity_multiplier
         ref_body_angular_vels = motion_state["body_ang_vel_t"] * velocity_multiplier
         ref_dof_pos = motion_state["dof_pos"] - self.default_joint_pos
@@ -166,21 +176,22 @@ class BFMZeroMotionProvider:
 
         obs_dict = compute_humanoid_observations_max(
             ref_body_pos,
-            ref_body_rots,
+            ref_body_rots_xyzw,
             ref_body_vels,
             ref_body_angular_vels,
             local_root_obs=True,
             root_height_obs=use_root_height_obs,
+            quat_format="xyzw",
         )
         max_local_self_obs = torch.cat([value for value in obs_dict.values()], dim=-1)
-        base_quat = ref_body_rots[:, 0]
-        ref_ang_vel = ref_body_angular_vels[:, 0]
+        base_quat_xyzw = ref_body_rots_xyzw[:, 0]
+        ref_base_ang_vel = ref_body_angular_vels[:, 0] * self.base_ang_vel_obs_scale
         projected_gravity = quat_rotate_inverse(
-            base_quat,
+            base_quat_xyzw,
             self.gravity_vec.repeat(max_local_self_obs.shape[0], 1),
             w_last=True,
         )
-        state = torch.cat([ref_dof_pos, ref_dof_vel, projected_gravity, ref_ang_vel], dim=-1)
+        state = torch.cat([ref_dof_pos, ref_dof_vel, projected_gravity, ref_base_ang_vel], dim=-1)
         last_action = ref_dof_pos
 
         obs = {
@@ -194,8 +205,10 @@ class BFMZeroMotionProvider:
             "ref_dof_pos": ref_dof_pos,
             "ref_dof_vel": ref_dof_vel,
             "projected_gravity": projected_gravity,
+            "ref_base_ang_vel": ref_base_ang_vel,
             "ref_body_pos": ref_body_pos,
-            "ref_body_rots": ref_body_rots,
+            "ref_body_rots_xyzw": ref_body_rots_xyzw,
+            "ref_body_rots": ref_body_rots_xyzw,
             "ref_body_vels": ref_body_vels,
             "ref_body_angular_vels": ref_body_angular_vels,
             "max_local_self_obs": max_local_self_obs,

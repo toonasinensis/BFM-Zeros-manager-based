@@ -21,17 +21,16 @@ import bfm
 from bfm.agents.fb.model import FBModel
 from bfm.agents.fb_cpr.model import FBcprModel
 from bfm.agents.fb_cpr_aux.model import FBcprAuxModel
-from bfm.manager_envs.g1.motion_provider import BFMZeroMotionProvider
-from bfm.manager_envs.g1.observations import compute_humanoid_observations_max
-from bfm.manager_envs.g1.spec import (
+from bfm.manager_envs.config.g1.g1_spec import (
     BFMZERO_BASE_ANG_VEL_OBS_SCALE,
     BFMZERO_DEFAULT_MOTION_FILE,
     BFMZERO_ROBOT_CONFIG,
     BFMZeroG1Spec,
-    assert_model_matches_bfmzero_contract,
     load_bfmzero_g1_spec,
     resolve_repo_path,
 )
+from bfm.manager_envs.mdp.motion_provider import BFMZeroMotionProvider
+from bfm.manager_envs.mdp.observations import compute_humanoid_observations_max
 from bfm.utils.torch_utils import quat_rotate_inverse, wxyz_to_xyzw
 
 MODEL_NAME_TO_CLASS = {
@@ -121,6 +120,7 @@ class LightweightG1MujocoEnv:
         mujoco_xml: Path | None = None,
         physics_fps: float = 200.0,
         control_decimation: int = 4,
+        base_ang_vel_obs_scale: float = BFMZERO_BASE_ANG_VEL_OBS_SCALE,
     ):
         self.spec = spec
         self.device = torch.device(device)
@@ -130,6 +130,7 @@ class LightweightG1MujocoEnv:
         self.data = mujoco.MjData(self.model)
         self.viewer = None
         self.show_reference = bool(show_reference)
+        self.base_ang_vel_obs_scale = float(base_ang_vel_obs_scale)
         self.reference_marker_pos: np.ndarray | None = None
         self.reference_marker_size = 0.035
 
@@ -198,11 +199,11 @@ class LightweightG1MujocoEnv:
     def reset_to_reference(self, ref_dict: dict[str, torch.Tensor], frame_id: int = 0) -> dict[str, torch.Tensor]:
         frame_id = int(frame_id)
         root_pos = ref_dict["ref_body_pos"][frame_id, 0].detach().cpu().numpy()
-        root_quat_xyzw = ref_dict["ref_body_rots"][frame_id, 0].detach().cpu().numpy()
+        root_quat_xyzw = ref_dict["ref_body_rots_xyzw"][frame_id, 0].detach().cpu().numpy()
         dof_pos = ref_dict["dof_pos"][frame_id].detach().cpu().numpy()
         root_lin_vel = ref_dict["ref_body_vels"][frame_id, 0].detach().cpu().numpy()
         root_ang_vel_world = ref_dict["ref_body_angular_vels"][frame_id : frame_id + 1, 0].to(device=self.device)
-        root_quat_xyzw_t = ref_dict["ref_body_rots"][frame_id : frame_id + 1, 0].to(device=self.device)
+        root_quat_xyzw_t = ref_dict["ref_body_rots_xyzw"][frame_id : frame_id + 1, 0].to(device=self.device)
         root_ang_vel = quat_rotate_inverse(root_quat_xyzw_t, root_ang_vel_world, w_last=True).detach().cpu().numpy().reshape(3)
         dof_vel = ref_dict["ref_dof_vel"][frame_id].detach().cpu().numpy()
 
@@ -234,7 +235,7 @@ class LightweightG1MujocoEnv:
         gravity = torch.tensor([[0.0, 0.0, -1.0]], dtype=torch.float32, device=self.device)
         projected_gravity = quat_rotate_inverse(root_quat_xyzw, gravity, w_last=True)
         base_ang_vel = torch.tensor(self.data.qvel[3:6], dtype=torch.float32, device=self.device).reshape(1, 3)
-        base_ang_vel = base_ang_vel * BFMZERO_BASE_ANG_VEL_OBS_SCALE
+        base_ang_vel = base_ang_vel * self.base_ang_vel_obs_scale
 
         joint_pos = torch.tensor(self.data.qpos[7:], dtype=torch.float32, device=self.device).reshape(1, -1)
         joint_vel = torch.tensor(self.data.qvel[6:], dtype=torch.float32, device=self.device).reshape(1, -1)
@@ -252,6 +253,7 @@ class LightweightG1MujocoEnv:
             body_ang_vel,
             local_root_obs=True,
             root_height_obs=True,
+            quat_format="xyzw",
         )
         privileged_state = torch.cat([value for value in max_local_self_dict.values()], dim=-1)
         action_obs = self.last_action.clone()
@@ -387,7 +389,8 @@ def _checkpoint_load_device(device: str) -> str:
 
 def _resolve_motion_file(model_folder: Path, data_path: Path | None) -> Path:
     if data_path is not None:
-        return Path(data_path).expanduser().resolve()
+        path = Path(data_path).expanduser().resolve()
+        return _validate_named_npz_motion_path(path)
     config_path = model_folder / "config.json"
     if config_path.exists():
         with config_path.open("r") as f:
@@ -396,8 +399,25 @@ def _resolve_motion_file(model_folder: Path, data_path: Path | None) -> Path:
         if configured:
             path = resolve_repo_path(configured)
             if path.exists():
-                return path
-    return resolve_repo_path(BFMZERO_DEFAULT_MOTION_FILE)
+                return _validate_named_npz_motion_path(path)
+    return _validate_named_npz_motion_path(resolve_repo_path(BFMZERO_DEFAULT_MOTION_FILE))
+
+
+def _validate_named_npz_motion_path(path: Path) -> Path:
+    path = Path(path).expanduser().resolve()
+    if path.is_dir():
+        if any(path.glob("*.npz")):
+            return path
+        raise FileNotFoundError(f"MuJoCo inference expected a named npz directory, but no .npz files were found: {path}")
+    if path.is_file() and path.suffix == ".npz":
+        return path
+    if path.suffix == ".pkl":
+        raise ValueError(
+            "MuJoCo inference in this manager-only repo only supports named npz motion data. "
+            f"Unsupported legacy pkl: {path}. Remove --data-path to use the checkpoint motion config, "
+            "or pass a named npz directory/file."
+        )
+    raise FileNotFoundError(f"MuJoCo inference expected a named npz directory or .npz file, got: {path}")
 
 
 def _resolve_robot_config(model_folder: Path, robot_config: str | None) -> str:
@@ -411,6 +431,19 @@ def _resolve_robot_config(model_folder: Path, robot_config: str | None) -> str:
         if configured:
             return str(configured)
     return BFMZERO_ROBOT_CONFIG
+
+
+def _resolve_base_ang_vel_obs_scale(model_folder: Path, base_ang_vel_obs_scale: float | None) -> float:
+    if base_ang_vel_obs_scale is not None:
+        return float(base_ang_vel_obs_scale)
+    config_path = model_folder / "config.json"
+    if config_path.exists():
+        with config_path.open("r") as f:
+            config = json.load(f)
+        configured = config.get("env", {}).get("base_ang_vel_obs_scale")
+        if configured is not None:
+            return float(configured)
+    return float(BFMZERO_BASE_ANG_VEL_OBS_SCALE)
 
 
 def _tracking_z(model, obs: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -502,6 +535,7 @@ def main(
     motion_list: list[int] = [25],
     steps: int = 200,
     device: str = "cpu",
+    base_ang_vel_obs_scale: float | None = None,
     headless: bool = True,
     policy_runtime: Literal["torch", "onnx"] = "onnx",
     check_onnx_parity: bool = True,
@@ -518,14 +552,21 @@ def main(
     checkpoint = _resolve_checkpoint(model_folder, checkpoint_dir)
     motion_file = _resolve_motion_file(model_folder, data_path)
     resolved_robot_config = _resolve_robot_config(model_folder, robot_config)
+    resolved_base_ang_vel_obs_scale = _resolve_base_ang_vel_obs_scale(model_folder, base_ang_vel_obs_scale)
     spec = load_bfmzero_g1_spec(resolved_robot_config)
     resolved_mujoco_xml = _resolve_mujoco_xml(spec, mujoco_xml)
-    provider = BFMZeroMotionProvider(motion_file=motion_file, spec=spec, num_envs=1, device=device)
+    #TODO:
+    provider = BFMZeroMotionProvider(
+        motion_file=motion_file,
+        spec=spec,
+        num_envs=1,
+        device=device,
+        base_ang_vel_obs_scale=1.0,
+    )
 
     model = _load_model_from_checkpoint_dir(checkpoint, device=_checkpoint_load_device(device))
     model.to(device)
     model.eval()
-    assert_model_matches_bfmzero_contract(model)
     history = "history_actor" in model.cfg.archi.actor.input_filter.key
 
     output_dir = model_folder / "tracking_inference_mujoco"
@@ -540,16 +581,19 @@ def main(
     print(
         "Slim MuJoCo inference config "
         f"model_folder={model_folder} checkpoint={checkpoint} motion_file={motion_file} "
-        f"robot_config={resolved_robot_config} device={device} runtime={policy_runtime} headless={headless}",
+        f"robot_config={resolved_robot_config} base_ang_vel_obs_scale={resolved_base_ang_vel_obs_scale} "
+        f"device={device} runtime={policy_runtime} headless={headless}",
         flush=True,
     )
-
+    #TODO: 
     env = LightweightG1MujocoEnv(
         spec=spec,
         device=device,
         headless=headless,
         show_reference=show_reference,
         mujoco_xml=resolved_mujoco_xml,
+        
+        base_ang_vel_obs_scale=0.250,#TODO:
     )
     print(
         f"Slim MuJoCo env xml={env.mujoco_xml} physics_dt={env.dt:.6f} control_dt={env.control_dt:.6f} "
@@ -581,7 +625,6 @@ def main(
                 if debug_trace_path is not None:
                     _append_trace(trace, "warmup", env.last_step_debug)
                     _append_trace(trace, "obs", observation)
-            assert_model_matches_bfmzero_contract(model, observation)
             rollout_steps = min(int(steps), int(z.shape[0]))
             metrics = {
                 "motion_id": motion_id,

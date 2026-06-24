@@ -15,7 +15,13 @@ from torch.utils._pytree import tree_map
 from bfm.agents.fb.model import FBModel
 from bfm.agents.fb_cpr.model import FBcprModel
 from bfm.agents.fb_cpr_aux.model import FBcprAuxModel
-from bfm.manager_envs.g1.spec import BFMZERO_DEFAULT_MOTION_FILE, BFMZERO_ROBOT_CONFIG, resolve_repo_path
+from bfm.manager_envs.config.g1.g1_spec import (
+    BFMZERO_BASE_ANG_VEL_OBS_SCALE,
+    BFMZERO_DEFAULT_MOTION_FILE,
+    BFMZERO_ROBOT_CONFIG,
+    assert_model_matches_bfmzero_contract,
+    resolve_repo_path,
+)
 
 DEFAULT_MODEL_FOLDER = Path("/home/thl/wt_wbc/BFM-Zero/results/results/bfmzero-isaac1")
 MODEL_NAME_TO_CLASS = {
@@ -58,6 +64,19 @@ def _resolve_robot_config(model_folder: Path, robot_config: str | None) -> str:
         if configured:
             return str(configured)
     return BFMZERO_ROBOT_CONFIG
+
+
+def _resolve_base_ang_vel_obs_scale(model_folder: Path, base_ang_vel_obs_scale: float | None) -> float:
+    if base_ang_vel_obs_scale is not None:
+        return float(base_ang_vel_obs_scale)
+    config_path = Path(model_folder) / "config.json"
+    if config_path.exists():
+        with config_path.open("r") as f:
+            config = json.load(f)
+        configured = config.get("env", {}).get("base_ang_vel_obs_scale")
+        if configured is not None:
+            return float(configured)
+    return float(BFMZERO_BASE_ANG_VEL_OBS_SCALE)
 
 
 def _checkpoint_load_device(device: str) -> str:
@@ -119,6 +138,7 @@ def main(
     steps: int = 100,
     headless: bool = True,
     device: str = "cuda:0",
+    base_ang_vel_obs_scale: float | None = None,
     save_mp4: bool = False,
     output_dir: Path | None = None,
 ):
@@ -126,12 +146,14 @@ def main(
     checkpoint = _resolve_checkpoint(model_folder, checkpoint_dir)
     motion_file = _resolve_motion_file(model_folder, data_path)
     resolved_robot_config = _resolve_robot_config(model_folder, robot_config)
+    resolved_base_ang_vel_obs_scale = _resolve_base_ang_vel_obs_scale(model_folder, base_ang_vel_obs_scale)
     output_dir = Path(output_dir) if output_dir is not None else model_folder / "tracking_inference_manager"
     output_dir.mkdir(parents=True, exist_ok=True)
     print(
         "Manager inference config "
         f"model_folder={model_folder} checkpoint={checkpoint} motion_file={motion_file} "
-        f"robot_config={resolved_robot_config} device={device} headless={headless}",
+        f"robot_config={resolved_robot_config} base_ang_vel_obs_scale={resolved_base_ang_vel_obs_scale} "
+        f"device={device} headless={headless}",
         flush=True,
     )
 
@@ -143,12 +165,11 @@ def main(
         flush=True,
     )
 
-    from bfm.manager_envs.g1.isaac_app import instantiate_isaac_sim
+    from bfm.manager_envs.mdp.isaac_app import instantiate_isaac_sim
 
     instantiate_isaac_sim(num_envs=1, enable_cameras=False, headless=headless)
 
-    from bfm.manager_envs.g1.adapter import BFMZeroManagerBuildConfig, BFMZeroManagerVectorEnvAdapter
-    from bfm.manager_envs.g1.spec import assert_model_matches_bfmzero_contract
+    from bfm.manager_envs.mdp.adapter import BFMZeroManagerBuildConfig, BFMZeroManagerVectorEnvAdapter
 
     adapter = BFMZeroManagerVectorEnvAdapter.build(
         BFMZeroManagerBuildConfig(
@@ -158,6 +179,7 @@ def main(
             robot_config=resolved_robot_config,
             default_motion_id=int(motion_list[0]),
             episode_length_s=max(float(steps) * 0.02 + 1.0, 10.0),
+            base_ang_vel_obs_scale=resolved_base_ang_vel_obs_scale,
             render_mode=None,
         )
     )
@@ -203,14 +225,17 @@ def main(
                 expert_qpos = np.concatenate(
                     [
                         ref_dict["ref_body_pos"][:, 0].detach().cpu().numpy(),
-                        np.roll(ref_dict["ref_body_rots"][:, 0].detach().cpu().numpy(), 1, axis=-1),
+                        np.roll(ref_dict["ref_body_rots_xyzw"][:, 0].detach().cpu().numpy(), 1, axis=-1),
                         ref_dict["dof_pos"].detach().cpu().numpy(),
                     ],
                     axis=-1,
                 )
                 rgb_renderer = IsaacRendererWithMuJoco(render_size=256)
                 expert_video = rgb_renderer.from_qpos(expert_qpos[: 1 + rollout_steps])
-                frames.append(rgb_renderer.render_qpos(adapter.mujoco_qpos().numpy()[0]))
+                raise RuntimeError(
+                    "--save-mp4 needs a renderer-side state conversion in the manager-only repo; "
+                    "adapter no longer exports MuJoCo qpos."
+                )
 
             with torch.no_grad():
                 for step in range(rollout_steps):
@@ -234,7 +259,10 @@ def main(
                     metrics["truncated_steps"] += int(truncated.sum().item())
                     metrics["completed_steps"] += 1
                     if save_mp4:
-                        frames.append(rgb_renderer.render_qpos(adapter.mujoco_qpos().numpy()[0]))
+                        raise RuntimeError(
+                            "--save-mp4 needs a renderer-side state conversion in the manager-only repo; "
+                            "adapter no longer exports MuJoCo qpos."
+                        )
                     if bool(torch.logical_or(terminated, truncated).any().item()):
                         break
 

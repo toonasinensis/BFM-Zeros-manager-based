@@ -1,26 +1,20 @@
 from __future__ import annotations
 
 import gc
+from dataclasses import dataclass
 from pathlib import Path
-import re
-from typing import Any
 
-import joblib
 import numpy as np
 import torch
-from easydict import EasyDict
 from loguru import logger
 
 from bfm.utils.torch_utils import slerp
 
-from .g1_kinematics import BFMZeroG1Kinematics
-from .spec import BFMZeroG1Spec
+from .spec import BFMZeroRobotSpec
 
 
-def _to_torch(value) -> torch.Tensor:
-    if torch.is_tensor(value):
-        return value
-    return torch.from_numpy(value)
+def _as_name_tuple(value: np.ndarray) -> tuple[str, ...]:
+    return tuple(str(name) for name in value.reshape(-1).tolist())
 
 
 def _name_permutation(actual_names: tuple[str, ...], expected_names: tuple[str, ...], *, context: str, path: Path) -> np.ndarray:
@@ -39,8 +33,15 @@ def _name_permutation(actual_names: tuple[str, ...], expected_names: tuple[str, 
     return np.asarray([name_to_index[name] for name in expected_names], dtype=np.int64)
 
 
-def _as_name_tuple(value: np.ndarray) -> tuple[str, ...]:
-    return tuple(str(name) for name in value.reshape(-1).tolist())
+def _npz_files(motion_path: Path) -> list[Path]:
+    if motion_path.is_dir():
+        files = sorted(motion_path.glob("*.npz"))
+        if not files:
+            raise FileNotFoundError(f"BFM-Zero named npz motion directory has no .npz files: {motion_path}")
+        return files
+    if motion_path.is_file() and motion_path.suffix == ".npz":
+        return [motion_path]
+    raise FileNotFoundError(f"Named npz motion source expects a .npz file or directory, got: {motion_path}")
 
 
 def _slice_bounds(seq_len: int, max_len: int) -> tuple[int, int]:
@@ -49,86 +50,39 @@ def _slice_bounds(seq_len: int, max_len: int) -> tuple[int, int]:
     return 0, int(max_len)
 
 
-_NAMED_NPZ_CHUNK_RE = re.compile(r"^(?P<family>.+)\.named_chunk(?P<chunk>\d+)_")
+def _validate_fixed_fps(data: np.lib.npyio.NpzFile, path: Path, expected_fps: int) -> None:
+    if "fps" not in data.files:
+        return
+    fps_values = np.asarray(data["fps"], dtype=np.float32).reshape(-1)
+    if fps_values.size == 0:
+        raise ValueError(f"{path}: fps key is present but empty")
+    if not np.allclose(fps_values, float(expected_fps)):
+        raise ValueError(
+            f"{path}: this minimal named npz loader is configured for {expected_fps}Hz, "
+            f"but file fps={fps_values.tolist()}"
+        )
 
 
-def _named_npz_legacy_key(path: Path) -> str | None:
-    match = _NAMED_NPZ_CHUNK_RE.match(path.name)
-    if match is None:
-        return None
-    return f"{match.group('family')}_clip{int(match.group('chunk'))}"
-
-
-def _candidate_legacy_order_files(motion_path: Path) -> tuple[Path, ...]:
-    roots = [motion_path.parent]
-    if motion_path.is_file():
-        roots.append(motion_path.parent.parent)
-    return tuple(root / "lafan_29dof_10s-clipped.pkl" for root in roots)
-
-
-def _legacy_order_for_named_npz(motion_path: Path) -> dict[str, int] | None:
-    for legacy_path in _candidate_legacy_order_files(motion_path):
-        if not legacy_path.is_file():
-            continue
-        motion_data = joblib.load(legacy_path)
-        if not isinstance(motion_data, dict):
-            raise TypeError(f"Expected legacy order pkl to contain a dict, got {type(motion_data)!r}: {legacy_path}")
-        logger.info(f"Ordering named npz motions by legacy pkl order from {legacy_path}")
-        return {str(key): index for index, key in enumerate(motion_data.keys())}
-    return None
-
-
-def _sort_named_npz_files(motion_path: Path, files: list[Path]) -> list[Path]:
-    legacy_order = _legacy_order_for_named_npz(motion_path)
-    if legacy_order is None:
-        return sorted(files)
-
-    missing = []
-
-    def sort_key(path: Path) -> tuple[int, str]:
-        legacy_key = _named_npz_legacy_key(path)
-        if legacy_key is None or legacy_key not in legacy_order:
-            missing.append(path.name)
-            return len(legacy_order), path.name
-        return legacy_order[legacy_key], path.name
-
-    ordered = sorted(files, key=sort_key)
-    if missing:
-        logger.warning(f"{len(missing)} named npz motions are not in legacy order; keeping them after ordered motions: {missing[:5]}")
-    return ordered
-
-
-def _recompute_dof_velocity_like_legacy(dof_pos: torch.Tensor, dt: float) -> torch.Tensor:
-    if dof_pos.ndim != 2:
-        raise ValueError(f"dof_pos must be 2D, got shape {tuple(dof_pos.shape)}")
-    if dof_pos.shape[0] <= 1:
-        return torch.zeros_like(dof_pos)
-    dof_vel = (dof_pos[1:] - dof_pos[:-1]) / float(dt)
-    tail = dof_vel[-2:-1] if dof_vel.shape[0] > 1 else dof_vel[-1:]
-    return torch.cat([dof_vel, tail], dim=0)
-
-
-class _LegacyPklMotionSource:
-    format_name = "legacy_pkl"
-
-    def __init__(self, motion_file: Path):
-        if not motion_file.is_file():
-            raise FileNotFoundError(f"BFM-Zero legacy motion source expects a pkl file, got: {motion_file}")
-        motion_data = joblib.load(motion_file)
-        if not isinstance(motion_data, dict):
-            raise TypeError(f"Expected BFM-Zero motion pkl to contain a dict, got {type(motion_data)!r}.")
-        self.motion_data_load = motion_data
-        self.keys = np.array(list(motion_data.keys()))
-        self.records = np.array(list(motion_data.values()), dtype=object)
-
-    def build_motion(self, motion_lib: "BFMZeroLightMotionLib", motion_data: dict[str, Any], *, max_len: int = -1):
-        return motion_lib._build_legacy_motion(motion_data, max_len=max_len)
+@dataclass
+class _LoadedMotion:
+    global_translation: torch.Tensor
+    global_rotation_xyzw: torch.Tensor
+    local_rotation_xyzw: torch.Tensor
+    global_root_velocity: torch.Tensor
+    global_root_angular_velocity: torch.Tensor
+    global_angular_velocity: torch.Tensor
+    global_velocity: torch.Tensor
+    dof_vels: torch.Tensor
+    dof_pos: torch.Tensor
+    global_translation_extend: torch.Tensor
+    global_rotation_xyzw_extend: torch.Tensor
+    global_velocity_extend: torch.Tensor
+    global_angular_velocity_extend: torch.Tensor
+    fps: int
 
 
 class _NamedNpzMotionSource:
-    format_name = "named_npz"
     required_keys = (
-        "fps",
         "joint_pos",
         "joint_vel",
         "body_pos_w",
@@ -139,17 +93,10 @@ class _NamedNpzMotionSource:
         "body_names",
     )
 
-    def __init__(self, motion_path: Path, spec: BFMZeroG1Spec):
+    def __init__(self, motion_path: Path, spec: BFMZeroRobotSpec, *, motion_fps: int):
         self.spec = spec
-        if motion_path.is_dir():
-            files = _sort_named_npz_files(motion_path, list(motion_path.glob("*.npz")))
-            if not files:
-                raise FileNotFoundError(f"BFM-Zero named npz motion directory has no .npz files: {motion_path}")
-        elif motion_path.is_file() and motion_path.suffix == ".npz":
-            files = [motion_path]
-        else:
-            raise FileNotFoundError(f"BFM-Zero named npz motion source expects a .npz file or directory, got: {motion_path}")
-
+        self.motion_fps = int(motion_fps)
+        files = _npz_files(motion_path)
         self.keys = np.array([path.name for path in files], dtype=object)
         self.records = np.array(files, dtype=object)
         self._joint_permutation_cache: dict[tuple[str, ...], np.ndarray] = {}
@@ -174,16 +121,11 @@ class _NamedNpzMotionSource:
             self._body_permutation_cache[body_names] = cached
         return cached
 
-    def build_motion(self, motion_lib: "BFMZeroLightMotionLib", motion_path: Path, *, max_len: int = -1):
+    def build_motion(self, motion_path: Path, *, max_len: int = -1) -> _LoadedMotion:
         motion_path = Path(motion_path)
         with np.load(motion_path, allow_pickle=False) as data:
             self._validate_required_keys(data, motion_path)
-            fps_values = np.asarray(data["fps"]).reshape(-1)
-            if fps_values.size == 0:
-                raise ValueError(f"{motion_path}: fps is empty")
-            fps = int(fps_values[0])
-            if fps <= 0:
-                raise ValueError(f"{motion_path}: fps must be positive, got {fps}")
+            _validate_fixed_fps(data, motion_path, self.motion_fps)
 
             joint_names = _as_name_tuple(np.asarray(data["joint_names"]))
             body_names = _as_name_tuple(np.asarray(data["body_names"]))
@@ -200,28 +142,35 @@ class _NamedNpzMotionSource:
         if joint_pos_raw.ndim != 2 or joint_pos_raw.shape[1] != len(joint_names):
             raise ValueError(f"{motion_path}: joint_pos shape {joint_pos_raw.shape} does not match joint_names={len(joint_names)}")
         seq_len = int(joint_pos_raw.shape[0])
+        if seq_len <= 0:
+            raise ValueError(f"{motion_path}: motion has no frames")
+
         expected_joint_shape = (seq_len, len(joint_names))
         if joint_vel_raw.shape != expected_joint_shape:
             raise ValueError(f"{motion_path}: joint_vel shape {joint_vel_raw.shape} != {expected_joint_shape}")
 
         expected_body_vec_shape = (seq_len, len(body_names), 3)
         expected_body_quat_shape = (seq_len, len(body_names), 4)
-        for key, value, expected_shape in (
-            ("body_pos_w", body_pos_raw, expected_body_vec_shape),
-            ("body_quat_w", body_quat_wxyz_raw, expected_body_quat_shape),
-            ("body_lin_vel_w", body_lin_vel_raw, expected_body_vec_shape),
-            ("body_ang_vel_w", body_ang_vel_raw, expected_body_vec_shape),
+        for key, value in (
+            ("body_pos_w", body_pos_raw),
+            ("body_lin_vel_w", body_lin_vel_raw),
+            ("body_ang_vel_w", body_ang_vel_raw),
         ):
-            if value.shape != expected_shape:
-                raise ValueError(f"{motion_path}: {key} shape {value.shape} != {expected_shape}")
+            if value.shape != expected_body_vec_shape:
+                raise ValueError(f"{motion_path}: {key} shape {value.shape} != {expected_body_vec_shape}")
+        if body_quat_wxyz_raw.shape != expected_body_quat_shape:
+            raise ValueError(f"{motion_path}: body_quat_w shape {body_quat_wxyz_raw.shape} != {expected_body_quat_shape}")
 
         start, end = _slice_bounds(seq_len, max_len)
+        if end <= start:
+            raise ValueError(f"{motion_path}: empty motion slice start={start} end={end}")
+
         joint_pos = np.ascontiguousarray(joint_pos_raw[start:end, joint_perm], dtype=np.float32)
-        joint_vel_raw = np.ascontiguousarray(joint_vel_raw[start:end, joint_perm], dtype=np.float32)
+        joint_vel = np.ascontiguousarray(joint_vel_raw[start:end, joint_perm], dtype=np.float32)
         body_pos = np.ascontiguousarray(body_pos_raw[start:end, body_perm], dtype=np.float32)
         body_quat_xyzw = np.ascontiguousarray(body_quat_wxyz_raw[start:end, body_perm][..., [1, 2, 3, 0]], dtype=np.float32)
-        body_lin_vel_raw = np.ascontiguousarray(body_lin_vel_raw[start:end, body_perm], dtype=np.float32)
-        body_ang_vel_raw = np.ascontiguousarray(body_ang_vel_raw[start:end, body_perm], dtype=np.float32)
+        body_lin_vel = np.ascontiguousarray(body_lin_vel_raw[start:end, body_perm], dtype=np.float32)
+        body_ang_vel = np.ascontiguousarray(body_ang_vel_raw[start:end, body_perm], dtype=np.float32)
 
         quat_norm = np.linalg.norm(body_quat_xyzw, axis=-1, keepdims=True)
         if not np.isfinite(quat_norm).all() or np.any(quat_norm <= 1.0e-8):
@@ -230,77 +179,74 @@ class _NamedNpzMotionSource:
 
         for key, value in (
             ("joint_pos", joint_pos),
-            ("joint_vel", joint_vel_raw),
+            ("joint_vel", joint_vel),
             ("body_pos_w", body_pos),
             ("body_quat_w", body_quat_xyzw),
-            ("body_lin_vel_w", body_lin_vel_raw),
-            ("body_ang_vel_w", body_ang_vel_raw),
+            ("body_lin_vel_w", body_lin_vel),
+            ("body_ang_vel_w", body_ang_vel),
         ):
             if not np.isfinite(value).all():
                 raise FloatingPointError(f"{motion_path}: {key} contains non-finite values")
 
-        dt = 1.0 / fps
+        joint_pos_t = torch.from_numpy(joint_pos)
         body_pos_t = torch.from_numpy(body_pos)
         body_quat_t = torch.from_numpy(body_quat_xyzw)
-        joint_pos_t = torch.from_numpy(joint_pos)
-        body_lin_vel = motion_lib.kinematics._compute_velocity(body_pos_t.unsqueeze(0), dt).squeeze(0)
-        body_ang_vel = motion_lib.kinematics._compute_angular_velocity(body_quat_t.unsqueeze(0), dt).squeeze(0)
-        joint_vel = _recompute_dof_velocity_like_legacy(joint_pos_t, dt)
+        joint_vel_t = torch.from_numpy(joint_vel)
+        body_lin_vel_t = torch.from_numpy(body_lin_vel)
+        body_ang_vel_t = torch.from_numpy(body_ang_vel)
 
         num_motion_bodies = len(self.spec.motion_body_names)
-        local_rotation = np.zeros_like(body_quat_xyzw)
-        local_rotation[..., 3] = 1.0
-        return EasyDict(
-            {
-                "global_translation": torch.from_numpy(body_pos[:, :num_motion_bodies]),
-                "global_rotation": torch.from_numpy(body_quat_xyzw[:, :num_motion_bodies]),
-                "local_rotation": torch.from_numpy(local_rotation),
-                "global_root_velocity": body_lin_vel[:, 0],
-                "global_root_angular_velocity": body_ang_vel[:, 0],
-                "global_angular_velocity": body_ang_vel[:, :num_motion_bodies],
-                "global_velocity": body_lin_vel[:, :num_motion_bodies],
-                "dof_vels": joint_vel,
-                "dof_pos": joint_pos_t,
-                "global_translation_extend": torch.from_numpy(body_pos),
-                "global_rotation_extend": torch.from_numpy(body_quat_xyzw),
-                "global_velocity_extend": body_lin_vel,
-                "global_angular_velocity_extend": body_ang_vel,
-                "fps": fps,
-            }
+        local_rotation_xyzw = torch.zeros_like(body_quat_t)
+        local_rotation_xyzw[..., 3] = 1.0
+        return _LoadedMotion(
+            global_translation=body_pos_t[:, :num_motion_bodies],
+            global_rotation_xyzw=body_quat_t[:, :num_motion_bodies],
+            local_rotation_xyzw=local_rotation_xyzw,
+            global_root_velocity=body_lin_vel_t[:, 0],
+            global_root_angular_velocity=body_ang_vel_t[:, 0],
+            global_angular_velocity=body_ang_vel_t[:, :num_motion_bodies],
+            global_velocity=body_lin_vel_t[:, :num_motion_bodies],
+            dof_vels=joint_vel_t,
+            dof_pos=joint_pos_t,
+            global_translation_extend=body_pos_t,
+            global_rotation_xyzw_extend=body_quat_t,
+            global_velocity_extend=body_lin_vel_t,
+            global_angular_velocity_extend=body_ang_vel_t,
+            fps=self.motion_fps,
         )
 
 
-def _make_motion_source(motion_file: Path, spec: BFMZeroG1Spec):
-    if motion_file.is_dir() or motion_file.suffix == ".npz":
-        return _NamedNpzMotionSource(motion_file, spec)
-    return _LegacyPklMotionSource(motion_file)
+class BFMZeroNamedNpzMotionLib:
+    """Minimal named npz-only motion library.
 
-
-class BFMZeroLightMotionLib:
-    """Minimal BFM-Zero motion lib for manager training and tracking."""
+    This loader assumes named npz data is already FK-expanded: joint positions,
+    world body positions, and world body quaternions are read directly from the
+    files, reordered by names, and interpolated. It never imports robot-specific
+    FK or uses external motion-id ordering.
+    """
 
     def __init__(
         self,
         *,
         motion_file: str | Path,
-        spec: BFMZeroG1Spec,
+        spec: BFMZeroRobotSpec,
         num_envs: int,
         device: str | torch.device,
         step_dt: float = 1 / 50,
+        motion_fps: int = 50,
     ):
         self.motion_file = Path(motion_file)
         self.spec = spec
         self.num_envs = int(num_envs)
         self._device = torch.device(device)
         self._sim_fps = 1 / float(step_dt)
+        self.motion_fps = int(motion_fps)
         self.all_motions_loaded = False
         self.has_action = False
+        self.num_joints = len(spec.observation_body_names)
+        self.num_bodies = len(spec.motion_body_names)
 
-        self.kinematics = BFMZeroG1Kinematics(spec, device=torch.device("cpu"))
-        self.num_joints = self.kinematics.num_bodies_augment
-        self.num_bodies = self.kinematics.num_bodies
-
-        logger.info(f"Loading lightweight BFM-Zero motion data from {self.motion_file}...")
+        logger.info(f"Loading minimal named npz BFM-Zero motion data from {self.motion_file} at {self.motion_fps}Hz...")
         self._load_data(self.motion_file)
         self._curr_motion_ids = None
         self._termination_history = torch.zeros(self._num_unique_motions, device=self._device)
@@ -311,15 +257,12 @@ class BFMZeroLightMotionLib:
         self._num_motions = 0
 
     def _load_data(self, motion_file: str | Path) -> None:
-        motion_file = Path(motion_file)
-        self._motion_source = _make_motion_source(motion_file, self.spec)
-        self._motion_format = self._motion_source.format_name
-        if hasattr(self._motion_source, "motion_data_load"):
-            self._motion_data_load = self._motion_source.motion_data_load
+        self._motion_source = _NamedNpzMotionSource(Path(motion_file), self.spec, motion_fps=self.motion_fps)
+        self._motion_format = "named_npz_50hz"
         self._motion_data_keys = self._motion_source.keys
         self._motion_data_list = self._motion_source.records
         self._num_unique_motions = len(self._motion_data_list)
-        logger.info(f"Loaded {self._num_unique_motions} lightweight BFM-Zero motions format={self._motion_format}")
+        logger.info(f"Loaded {self._num_unique_motions} minimal named npz BFM-Zero motions")
 
     def update_sampling_weight_by_id(self, priorities: list, motions_id: list, file_name: dict[int, str] | None = None) -> None:
         if len(motions_id) != len(priorities):
@@ -330,7 +273,7 @@ class BFMZeroLightMotionLib:
 
         new_sampling_prob = torch.zeros(self._num_unique_motions, dtype=torch.float32, device=self._device)
         normalized = priorities_t / priorities_t.sum()
-        for raw_motion_id, priority in zip(motions_id, normalized, strict=True):
+        for raw_motion_id, priority in zip(motions_id, normalized):
             motion_id = int(raw_motion_id)
             if file_name is not None:
                 expected_name = str(self._motion_data_keys[motion_id])
@@ -392,7 +335,7 @@ class BFMZeroLightMotionLib:
         self.curr_motion_keys = [str(self._motion_data_keys[int(idx)]) for idx in self._curr_motion_ids.detach().cpu().tolist()]
         self._update_sampling_batch_prob()
 
-        logger.info(f"Light loading {num_motion_to_load} motions...")
+        logger.info(f"Named npz loading {num_motion_to_load} motions...")
         logger.info(f"Sampling motion: {sample_idxes[:10]}, ....")
         logger.info(f"Current motion keys: {self.curr_motion_keys[:10]}, ....")
 
@@ -405,8 +348,8 @@ class BFMZeroLightMotionLib:
         motion_aa = []
 
         for motion_data in self._motion_data_list[sample_idxes.detach().cpu().numpy()]:
-            curr_motion = self._motion_source.build_motion(self, motion_data, max_len=max_len)
-            num_frames = int(curr_motion.global_rotation.shape[0])
+            curr_motion = self._motion_source.build_motion(Path(motion_data), max_len=max_len)
+            num_frames = int(curr_motion.global_rotation_xyzw.shape[0])
             fps = int(curr_motion.fps)
             dt = 1.0 / fps
             motion_lengths.append(dt * (num_frames - 1))
@@ -426,20 +369,18 @@ class BFMZeroLightMotionLib:
         self._num_motions = len(motions)
 
         self.gts = torch.cat([m.global_translation for m in motions], dim=0).float().to(self._device)
-        self.grs = torch.cat([m.global_rotation for m in motions], dim=0).float().to(self._device)
-        self.lrs = torch.cat([m.local_rotation for m in motions], dim=0).float().to(self._device)
+        self.grs_xyzw = torch.cat([m.global_rotation_xyzw for m in motions], dim=0).float().to(self._device)
+        self.lrs_xyzw = torch.cat([m.local_rotation_xyzw for m in motions], dim=0).float().to(self._device)
         self.grvs = torch.cat([m.global_root_velocity for m in motions], dim=0).float().to(self._device)
         self.gravs = torch.cat([m.global_root_angular_velocity for m in motions], dim=0).float().to(self._device)
         self.gavs = torch.cat([m.global_angular_velocity for m in motions], dim=0).float().to(self._device)
         self.gvs = torch.cat([m.global_velocity for m in motions], dim=0).float().to(self._device)
         self.dvs = torch.cat([m.dof_vels for m in motions], dim=0).float().to(self._device)
         self.dof_pos = torch.cat([m.dof_pos for m in motions], dim=0).float().to(self._device)
-
-        if hasattr(motions[0], "global_translation_extend"):
-            self.gts_t = torch.cat([m.global_translation_extend for m in motions], dim=0).float().to(self._device)
-            self.grs_t = torch.cat([m.global_rotation_extend for m in motions], dim=0).float().to(self._device)
-            self.gvs_t = torch.cat([m.global_velocity_extend for m in motions], dim=0).float().to(self._device)
-            self.gavs_t = torch.cat([m.global_angular_velocity_extend for m in motions], dim=0).float().to(self._device)
+        self.gts_t = torch.cat([m.global_translation_extend for m in motions], dim=0).float().to(self._device)
+        self.grs_t_xyzw = torch.cat([m.global_rotation_xyzw_extend for m in motions], dim=0).float().to(self._device)
+        self.gvs_t = torch.cat([m.global_velocity_extend for m in motions], dim=0).float().to(self._device)
+        self.gavs_t = torch.cat([m.global_angular_velocity_extend for m in motions], dim=0).float().to(self._device)
 
         lengths_shifted = self._motion_num_frames.roll(1)
         lengths_shifted[0] = 0
@@ -447,7 +388,7 @@ class BFMZeroLightMotionLib:
         self.motion_ids = torch.arange(len(motions), dtype=torch.long, device=self._device)
 
         logger.info(
-            f"Light loaded {self.num_motions():d} motions with a total length of {float(self.get_total_length()):.3f}s "
+            f"Named npz loaded {self.num_motions():d} motions with a total length of {float(self.get_total_length()):.3f}s "
             f"and {self.gts.shape[0]} frames."
         )
         del motions
@@ -455,20 +396,11 @@ class BFMZeroLightMotionLib:
             torch.cuda.empty_cache()
         gc.collect()
 
-    def _build_legacy_motion(self, motion_data: dict[str, Any], *, max_len: int = -1):
-        seq_len = int(motion_data["root_trans_offset"].shape[0])
-        start, end = _slice_bounds(seq_len, max_len)
-        trans = _to_torch(motion_data["root_trans_offset"]).clone()[start:end]
-        pose_aa = _to_torch(motion_data["pose_aa"]).clone()[start:end]
-        dt = 1 / int(motion_data["fps"])
-        curr_motion = self.kinematics.fk_batch(pose_aa[None], trans[None], return_full=True, dt=dt)
-        return EasyDict({key: value.squeeze() if torch.is_tensor(value) else value for key, value in curr_motion.items()})
-
     def _clear_loaded_tensors(self) -> None:
         for name in (
             "gts",
-            "grs",
-            "lrs",
+            "grs_xyzw",
+            "lrs_xyzw",
             "grvs",
             "gravs",
             "gavs",
@@ -476,7 +408,7 @@ class BFMZeroLightMotionLib:
             "dvs",
             "dof_pos",
             "gts_t",
-            "grs_t",
+            "grs_t_xyzw",
             "gvs_t",
             "gavs_t",
         ):
@@ -513,7 +445,7 @@ class BFMZeroLightMotionLib:
 
     def _calc_frame_blend(self, time: torch.Tensor, motion_len: torch.Tensor, num_frames: torch.Tensor, dt: torch.Tensor):
         time = time.clone()
-        phase = torch.clip(time / motion_len, 0.0, 1.0)
+        phase = torch.clip(time / torch.clamp(motion_len, min=1.0e-8), 0.0, 1.0)
         time[time < 0] = 0
         frame_idx0 = (phase * (num_frames - 1)).long()
         frame_idx1 = torch.min(frame_idx0 + 1, num_frames - 1)
@@ -539,10 +471,6 @@ class BFMZeroLightMotionLib:
         dof_vel0 = self.dvs[f0l]
         dof_vel1 = self.dvs[f1l]
 
-        for value in (local_rot0, local_rot1, body_vel0, body_vel1, body_ang_vel0, body_ang_vel1, rg_pos0, rg_pos1, dof_vel0, dof_vel1):
-            if value.dtype == torch.float64:
-                raise AssertionError("BFM-Zero light motion tensors must not be float64")
-
         blend = blend.unsqueeze(-1)
         blend_exp = blend.unsqueeze(-1)
         if offset is None:
@@ -554,35 +482,30 @@ class BFMZeroLightMotionLib:
         dof_vel = (1.0 - blend) * dof_vel0 + blend * dof_vel1
         dof_pos = (1.0 - blend) * local_rot0 + blend * local_rot1
 
-        rb_rot0 = self.grs[f0l]
-        rb_rot1 = self.grs[f1l]
-        rb_rot = slerp(rb_rot0, rb_rot1, blend_exp)
+        rb_rot_xyzw0 = self.grs_xyzw[f0l]
+        rb_rot_xyzw1 = self.grs_xyzw[f1l]
+        rb_rot_xyzw = slerp(rb_rot_xyzw0, rb_rot_xyzw1, blend_exp)
 
-        if hasattr(self, "gts_t"):
-            rg_pos_t0 = self.gts_t[f0l]
-            rg_pos_t1 = self.gts_t[f1l]
-            rg_rot_t0 = self.grs_t[f0l]
-            rg_rot_t1 = self.grs_t[f1l]
-            body_vel_t0 = self.gvs_t[f0l]
-            body_vel_t1 = self.gvs_t[f1l]
-            body_ang_vel_t0 = self.gavs_t[f0l]
-            body_ang_vel_t1 = self.gavs_t[f1l]
-            if offset is None:
-                rg_pos_t = (1.0 - blend_exp) * rg_pos_t0 + blend_exp * rg_pos_t1
-            else:
-                rg_pos_t = (1.0 - blend_exp) * rg_pos_t0 + blend_exp * rg_pos_t1 + offset[..., None, :]
-            rg_rot_t = slerp(rg_rot_t0, rg_rot_t1, blend_exp)
-            body_vel_t = (1.0 - blend_exp) * body_vel_t0 + blend_exp * body_vel_t1
-            body_ang_vel_t = (1.0 - blend_exp) * body_ang_vel_t0 + blend_exp * body_ang_vel_t1
+        rg_pos_t0 = self.gts_t[f0l]
+        rg_pos_t1 = self.gts_t[f1l]
+        rg_rot_t_xyzw0 = self.grs_t_xyzw[f0l]
+        rg_rot_t_xyzw1 = self.grs_t_xyzw[f1l]
+        body_vel_t0 = self.gvs_t[f0l]
+        body_vel_t1 = self.gvs_t[f1l]
+        body_ang_vel_t0 = self.gavs_t[f0l]
+        body_ang_vel_t1 = self.gavs_t[f1l]
+        if offset is None:
+            rg_pos_t = (1.0 - blend_exp) * rg_pos_t0 + blend_exp * rg_pos_t1
         else:
-            rg_pos_t = rg_pos
-            rg_rot_t = rb_rot
-            body_vel_t = body_vel
-            body_ang_vel_t = body_ang_vel
+            rg_pos_t = (1.0 - blend_exp) * rg_pos_t0 + blend_exp * rg_pos_t1 + offset[..., None, :]
+        rg_rot_t_xyzw = slerp(rg_rot_t_xyzw0, rg_rot_t_xyzw1, blend_exp)
+        body_vel_t = (1.0 - blend_exp) * body_vel_t0 + blend_exp * body_vel_t1
+        body_ang_vel_t = (1.0 - blend_exp) * body_ang_vel_t0 + blend_exp * body_ang_vel_t1
 
         return {
             "root_pos": rg_pos[..., 0, :].clone(),
-            "root_rot": rb_rot[..., 0, :].clone(),
+            "root_rot_xyzw": rb_rot_xyzw[..., 0, :].clone(),
+            "root_rot": rb_rot_xyzw[..., 0, :].clone(),
             "dof_pos": dof_pos.clone(),
             "root_vel": body_vel[..., 0, :].clone(),
             "root_ang_vel": body_ang_vel[..., 0, :].clone(),
@@ -590,11 +513,13 @@ class BFMZeroLightMotionLib:
             "motion_aa": self._motion_aa[f0l].clone(),
             "motion_bodies": self._motion_bodies[motion_ids].clone(),
             "rg_pos": rg_pos.clone(),
-            "rb_rot": rb_rot.clone(),
+            "rb_rot_xyzw": rb_rot_xyzw.clone(),
+            "rb_rot": rb_rot_xyzw.clone(),
             "body_vel": body_vel.clone(),
             "body_ang_vel": body_ang_vel.clone(),
             "rg_pos_t": rg_pos_t.clone(),
-            "rg_rot_t": rg_rot_t.clone(),
+            "rg_rot_t_xyzw": rg_rot_t_xyzw.clone(),
+            "rg_rot_t": rg_rot_t_xyzw.clone(),
             "body_vel_t": body_vel_t.clone(),
             "body_ang_vel_t": body_ang_vel_t.clone(),
         }

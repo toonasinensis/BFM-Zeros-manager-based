@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import torch
 
 
 @dataclass
@@ -52,8 +53,13 @@ class TrainContext:
     def timestep(self) -> int:
         return int(self.state.t)
 
-    def reset_rollout_state(self) -> None:
+    def reset_rollout_state(self, episode_length_buf: torch.Tensor | None = None) -> None:
         td, info = self.runtime.train_env.reset()
+        if episode_length_buf is not None:
+            self.runtime.train_env.episode_length_buf[:] = episode_length_buf.to(
+                device=self.runtime.train_env.episode_length_buf.device,
+                dtype=self.runtime.train_env.episode_length_buf.dtype,
+            )
         self.state.td = td
         self.state.info = info
         self.state.terminated = np.zeros(self.cfg.online_parallel_envs, dtype=bool)

@@ -10,17 +10,18 @@ from torch.utils._pytree import tree_map
 
 from bfm.agents.base import BaseConfig
 from bfm.agents.buffers.trajectory import TrajectoryDictBuffer
-from bfm.manager_envs.g1.observations import compute_humanoid_observations_max
-from bfm.manager_envs.g1.motion_provider import BFMZeroMotionProvider
-from bfm.manager_envs.g1.spec import (
+from bfm.manager_envs.config.g1.g1_spec import (
     BFMZERO_DEFAULT_MOTION_FILE,
-    BFMZERO_NO_HEAD_ROBOT_CONFIG,
+    BFMZERO_BASE_ANG_VEL_OBS_SCALE,
     BFMZERO_HISTORY_CONFIG,
     BFMZERO_HISTORY_ORDER,
+    BFMZERO_NO_HEAD_ROBOT_CONFIG,
     assert_bfmzero_spec_consistent,
     load_bfmzero_g1_spec,
     resolve_repo_path,
 )
+from bfm.manager_envs.mdp.motion_provider import BFMZeroMotionProvider
+from bfm.manager_envs.mdp.observations import compute_humanoid_observations_max
 from bfm.utils.torch_utils import quat_rotate_inverse
 
 
@@ -34,6 +35,7 @@ def load_expert_trajectories_from_bfmzero_manager_motion_lib(env: "BFMZeroManage
         spec=env.adapter.spec,
         num_envs=env.num_envs,
         device=env.device,
+        base_ang_vel_obs_scale=getattr(env.adapter, "base_ang_vel_obs_scale", None),
     )
     provider.load_for_training()
 
@@ -48,35 +50,36 @@ def load_expert_trajectories_from_bfmzero_manager_motion_lib(env: "BFMZeroManage
         file_names.append(provider.motion_lib.curr_motion_keys[local_motion_id])
 
         ref_body_pos = motion_res["rg_pos_t"]
-        ref_body_rots = motion_res["rg_rot_t"]
+        ref_body_rots_xyzw = motion_res["rg_rot_t_xyzw"]
         ref_body_vels = motion_res["body_vel_t"]
         ref_body_angular_vels = motion_res["body_ang_vel_t"]
 
         obs_dict = compute_humanoid_observations_max(
             ref_body_pos,
-            ref_body_rots,
+            ref_body_rots_xyzw,
             ref_body_vels,
             ref_body_angular_vels,
             local_root_obs=True,
             root_height_obs=True,
+            quat_format="xyzw",
         )
         privileged_state = torch.cat([value for value in obs_dict.values()], dim=-1)
 
         ref_dof_pos = motion_res["dof_pos"] - provider.default_joint_pos
         ref_dof_vel = motion_res["dof_vel"]
-        ref_ang_vel = ref_body_angular_vels[:, 0]
+        ref_base_ang_vel = ref_body_angular_vels[:, 0] * provider.base_ang_vel_obs_scale
         projected_gravity = quat_rotate_inverse(
-            ref_body_rots[:, 0],
+            ref_body_rots_xyzw[:, 0],
             provider.gravity_vec.repeat(privileged_state.shape[0], 1),
             w_last=True,
         )
-        state = torch.cat([ref_dof_pos, ref_dof_vel, projected_gravity, ref_ang_vel], dim=-1)
+        state = torch.cat([ref_dof_pos, ref_dof_vel, projected_gravity, ref_base_ang_vel], dim=-1)
         last_action = torch.zeros_like(ref_dof_pos)
 
         history_actor_dim = 0
         dims = {
             "actions": last_action.shape[-1],
-            "base_ang_vel": ref_ang_vel.shape[-1],
+            "base_ang_vel": ref_base_ang_vel.shape[-1],
             "dof_pos": ref_dof_pos.shape[-1],
             "dof_vel": ref_dof_vel.shape[-1],
             "projected_gravity": projected_gravity.shape[-1],
@@ -116,14 +119,12 @@ class BFMZeroManagerVectorEnv(VectorEnv):
         adapter,
         *,
         motion_file: str | Path,
-        add_time_aware_observation: bool = True,
     ):
         super().__init__()
         self.adapter = adapter
         self._env = adapter
         self.num_envs = adapter.num_envs
         self.motion_file = str(motion_file)
-        self.add_time_aware_observation = add_time_aware_observation
         self._last_obs_torch, _ = self.reset(to_numpy=False)
 
         observation_spaces = {}
@@ -132,7 +133,7 @@ class BFMZeroManagerVectorEnv(VectorEnv):
                 low=-float("inf"),
                 high=float("inf"),
                 shape=tuple(value.shape),
-                dtype=np.float32 if key != "time" else np.int32,
+                dtype=np.float32,
             )
         self.observation_space = gymnasium.spaces.Dict(observation_spaces)
 
@@ -163,6 +164,10 @@ class BFMZeroManagerVectorEnv(VectorEnv):
         return self.base_env
 
     @property
+    def episode_length_buf(self) -> torch.Tensor:
+        return self.base_env.episode_length_buf
+
+    @property
     def single_observation_space(self):
         single_obs_spaces = {}
         for key, space in self.observation_space.spaces.items():
@@ -174,18 +179,27 @@ class BFMZeroManagerVectorEnv(VectorEnv):
             )
         return gymnasium.spaces.Dict(single_obs_spaces)
 
-    def _add_time(self, observation: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        if self.add_time_aware_observation:
-            observation = dict(observation)
-            observation["time"] = self.base_env.episode_length_buf.unsqueeze(-1)
-        return observation
-
-    def _qpos_qvel(self, to_numpy: bool = True) -> tuple[torch.Tensor | np.ndarray, torch.Tensor | np.ndarray]:
-        qpos = self.adapter.mujoco_qpos()
-        qvel = self.adapter.mujoco_qvel()
+    def _manager_state_snapshot(self, to_numpy: bool = True) -> tuple[torch.Tensor | np.ndarray, torch.Tensor | np.ndarray]:
+        robot = self.adapter.robot
+        qpos = torch.cat(
+            [
+                robot.data.root_pos_w,
+                robot.data.root_quat_w,
+                robot.data.joint_pos[:, self.adapter.joint_indexes],
+            ],
+            dim=-1,
+        ).detach()
+        qvel = torch.cat(
+            [
+                robot.data.root_lin_vel_w,
+                robot.data.root_ang_vel_b,
+                robot.data.joint_vel[:, self.adapter.joint_indexes],
+            ],
+            dim=-1,
+        ).detach()
         if to_numpy:
-            return qpos.numpy(), qvel.numpy()
-        return qpos.to(self.device), qvel.to(self.device)
+            return qpos.cpu().numpy(), qvel.cpu().numpy()
+        return qpos, qvel
 
     def reset(
         self,
@@ -196,8 +210,7 @@ class BFMZeroManagerVectorEnv(VectorEnv):
     ):
         del seed, options
         observation, info = self.adapter.reset()
-        observation = self._add_time(observation)
-        qpos, qvel = self._qpos_qvel(to_numpy=to_numpy)
+        qpos, qvel = self._manager_state_snapshot(to_numpy=to_numpy)
         info = dict(info)
         info["qpos"] = qpos
         info["qvel"] = qvel
@@ -211,8 +224,7 @@ class BFMZeroManagerVectorEnv(VectorEnv):
         else:
             global_motion_ids_t = torch.as_tensor(global_motion_ids, dtype=torch.long, device=self.device)
         observation, info = self.adapter.reset_to_motions(global_motion_ids_t, frame_id=frame_id)
-        observation = self._add_time(observation)
-        qpos, qvel = self._qpos_qvel(to_numpy=to_numpy)
+        qpos, qvel = self._manager_state_snapshot(to_numpy=to_numpy)
         info = dict(info)
         info["qpos"] = qpos
         info["qvel"] = qvel
@@ -226,8 +238,7 @@ class BFMZeroManagerVectorEnv(VectorEnv):
         else:
             actions_t = actions.to(device=self.device, dtype=torch.float32)
         observation, reward, terminated, truncated, info = self.adapter.step(actions_t)
-        observation = self._add_time(observation)
-        qpos, qvel = self._qpos_qvel(to_numpy=to_numpy)
+        qpos, qvel = self._manager_state_snapshot(to_numpy=to_numpy)
         info = dict(info)
         info["qpos"] = qpos
         info["qvel"] = qvel
@@ -238,8 +249,6 @@ class BFMZeroManagerVectorEnv(VectorEnv):
             truncated = truncated.detach().cpu().numpy()
         return observation, reward, terminated, truncated, info
 
-    def order_contract(self) -> dict[str, Any]:
-        return self.adapter.order_contract()
 
     def update_motion_sampling_weights(self, priorities: list, motion_indexes: list, file_name: dict[int, str] | None = None) -> None:
         self.adapter.update_motion_sampling_weights(priorities=priorities, motion_indexes=motion_indexes, file_name=file_name)
@@ -271,6 +280,7 @@ class BFMZeroManagerIsaacConfig(BaseConfig):
     default_motion_id: int = 0
     training_randomize_motions: bool = True
     training_max_num_seqs: int | None = None
+    base_ang_vel_obs_scale: float = BFMZERO_BASE_ANG_VEL_OBS_SCALE
     enable_domain_randomization: bool = False
     render_mode: str | None = None
 
@@ -290,11 +300,11 @@ class BFMZeroManagerIsaacConfig(BaseConfig):
                 )
             return _bfmzero_manager_env_singleton, {}
 
-        from bfm.manager_envs.g1.isaac_app import instantiate_isaac_sim
+        from bfm.manager_envs.mdp.isaac_app import instantiate_isaac_sim
 
         instantiate_isaac_sim(num_envs, enable_cameras=self.enable_cameras, headless=self.headless)
 
-        from bfm.manager_envs.g1.adapter import BFMZeroManagerBuildConfig, BFMZeroManagerVectorEnvAdapter
+        from bfm.manager_envs.mdp.adapter import BFMZeroManagerBuildConfig, BFMZeroManagerVectorEnvAdapter
 
         spec = load_bfmzero_g1_spec(self.robot_config)
         assert_bfmzero_spec_consistent(spec)
@@ -309,6 +319,7 @@ class BFMZeroManagerIsaacConfig(BaseConfig):
                 episode_length_s=float(self.max_episode_length_s or 10.0),
                 training_randomize_motions=self.training_randomize_motions,
                 training_max_num_seqs=self.training_max_num_seqs,
+                base_ang_vel_obs_scale=self.base_ang_vel_obs_scale,
                 enable_domain_randomization=self.enable_domain_randomization,
                 render_mode=self.render_mode,
             )
@@ -316,7 +327,7 @@ class BFMZeroManagerIsaacConfig(BaseConfig):
         env = BFMZeroManagerVectorEnv(adapter, motion_file=motion_file)
         _bfmzero_manager_env_singleton = env
         return env, {
-            "order_contract": env.order_contract(),
             "robot_config": self.robot_config,
+            "base_ang_vel_obs_scale": self.base_ang_vel_obs_scale,
             "enable_domain_randomization": self.enable_domain_randomization,
         }

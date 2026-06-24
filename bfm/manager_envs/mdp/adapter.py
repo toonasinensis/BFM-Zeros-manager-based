@@ -2,17 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
-from bfm.utils.torch_utils import quat_mul, quat_rotate, quat_rotate_inverse
+from bfm.utils.torch_utils import quat_mul, quat_rotate
 
-from . import mdp
-from .env_cfg import build_bfmzero_manager_env
 from .motion_command import BFMZeroMotionCommand
-from .observations import compute_humanoid_observations_max
-from .motion_provider import finite_dict_assert, wxyz_to_xyzw
+from .observations import bfmzero_privileged_state_terms, bfmzero_state_terms
+from .motion_provider import finite_dict_assert
 from .rewards import (
     BFMZERO_ENV_REWARD_SCALES,
     BFMZERO_INITIAL_PENALTY_SCALE,
@@ -24,13 +22,59 @@ from .spec import (
     BFMZERO_DEFAULT_MOTION_FILE,
     BFMZERO_HISTORY_CONFIG,
     BFMZERO_HISTORY_ORDER,
-    BFMZERO_ROBOT_CONFIG,
-    BFMZeroG1Spec,
-    assert_bfmzero_spec_consistent,
     assert_model_matches_bfmzero_contract,
-    load_bfmzero_g1_spec,
+    BFMZeroRobotSpec,
     resolve_repo_path,
 )
+
+
+def _default_robot_config() -> str:
+    from bfm.manager_envs.config.g1.g1_spec import BFMZERO_ROBOT_CONFIG
+
+    return BFMZERO_ROBOT_CONFIG
+
+
+def _default_load_robot_spec(robot_config: str) -> BFMZeroRobotSpec:
+    from bfm.manager_envs.config.g1.g1_spec import load_bfmzero_g1_spec
+
+    return load_bfmzero_g1_spec(robot_config)
+
+
+def _default_assert_robot_spec_consistent(spec: BFMZeroRobotSpec) -> None:
+    from bfm.manager_envs.config.g1.g1_spec import assert_bfmzero_spec_consistent
+
+    assert_bfmzero_spec_consistent(spec)
+
+
+def _default_build_manager_env(
+    *,
+    num_envs: int,
+    device: str,
+    motion_file: str | Path,
+    robot_config: str,
+    default_motion_id: int,
+    episode_length_s: float,
+    training_randomize_motions: bool,
+    training_max_num_seqs: int | None,
+    base_ang_vel_obs_scale: float | None,
+    enable_domain_randomization: bool,
+    render_mode: str | None,
+):
+    from bfm.manager_envs.config.g1.g1_env_cfg import build_bfmzero_manager_env
+
+    return build_bfmzero_manager_env(
+        num_envs=num_envs,
+        device=device,
+        motion_file=motion_file,
+        robot_config=robot_config,
+        default_motion_id=default_motion_id,
+        episode_length_s=episode_length_s,
+        training_randomize_motions=training_randomize_motions,
+        training_max_num_seqs=training_max_num_seqs,
+        base_ang_vel_obs_scale=base_ang_vel_obs_scale,
+        enable_domain_randomization=enable_domain_randomization,
+        render_mode=render_mode,
+    )
 
 
 class BFMZeroHistory:
@@ -81,23 +125,43 @@ class BFMZeroManagerBuildConfig:
     num_envs: int = 1
     device: str = "cuda:0"
     motion_file: str | Path = BFMZERO_DEFAULT_MOTION_FILE
-    robot_config: str = BFMZERO_ROBOT_CONFIG
+    robot_config: str | None = None
     default_motion_id: int = 0
     episode_length_s: float = 10.0
     training_randomize_motions: bool = False
     training_max_num_seqs: int | None = None
     enable_domain_randomization: bool = False
     render_mode: str | None = None
+    build_env: Callable[..., Any] = _default_build_manager_env
+    load_robot_spec: Callable[[str], BFMZeroRobotSpec] = _default_load_robot_spec
+    assert_spec_consistent: Callable[[BFMZeroRobotSpec], None] = _default_assert_robot_spec_consistent
+    base_ang_vel_obs_scale: float | None = None
+
+    def resolved_robot_config(self) -> str:
+        return self.robot_config or _default_robot_config()
 
 
 class BFMZeroManagerVectorEnvAdapter:
     """Expose a manager-based IsaacLab env through the dict observation contract used by BFM-Zero checkpoints."""
 
-    def __init__(self, env, *, spec: BFMZeroG1Spec | None = None):
+    def __init__(
+        self,
+        env,
+        *,
+        spec: BFMZeroRobotSpec | None = None,
+        load_robot_spec: Callable[[str], BFMZeroRobotSpec] = _default_load_robot_spec,
+        assert_spec_consistent: Callable[[BFMZeroRobotSpec], None] = _default_assert_robot_spec_consistent,
+        base_ang_vel_obs_scale: float | None = None,
+    ):
         self.env = env
         self.unwrapped = env.unwrapped if hasattr(env, "unwrapped") else env
-        self.spec = spec or load_bfmzero_g1_spec()
-        assert_bfmzero_spec_consistent(self.spec)
+        self.spec = spec or load_robot_spec(_default_robot_config())
+        assert_spec_consistent(self.spec)
+        self.base_ang_vel_obs_scale = (
+            float(base_ang_vel_obs_scale)
+            if base_ang_vel_obs_scale is not None
+            else float(getattr(self.spec, "base_ang_vel_obs_scale", BFMZERO_BASE_ANG_VEL_OBS_SCALE))
+        )
         self.robot = self.unwrapped.scene["robot"]
         self.motion_command: BFMZeroMotionCommand = self.unwrapped.command_manager.get_term("motion")
         self.num_envs = int(self.unwrapped.num_envs)
@@ -116,26 +180,34 @@ class BFMZeroManagerVectorEnvAdapter:
         self.last_action = torch.zeros(self.num_envs, self.spec.num_actions, dtype=torch.float32, device=self.device)
         self.unwrapped.bfmzero_last_action_obs = self.last_action.clone()
         self.aux_reward_names = tuple(name for name in BFMZERO_RAW_AUX_REWARD_NAMES if name in self._reward_term_names())
-        self.assert_order_contract()
 
     @classmethod
     def build(cls, cfg: BFMZeroManagerBuildConfig | None = None) -> "BFMZeroManagerVectorEnvAdapter":
         cfg = cfg or BFMZeroManagerBuildConfig()
         motion_file = resolve_repo_path(cfg.motion_file)
-        spec = load_bfmzero_g1_spec(cfg.robot_config)
-        env = build_bfmzero_manager_env(
+        robot_config = cfg.resolved_robot_config()
+        spec = cfg.load_robot_spec(robot_config)
+        cfg.assert_spec_consistent(spec)
+        env = cfg.build_env(
             num_envs=cfg.num_envs,
             device=cfg.device,
             motion_file=motion_file,
-            robot_config=cfg.robot_config,
+            robot_config=robot_config,
             default_motion_id=cfg.default_motion_id,
             episode_length_s=cfg.episode_length_s,
             training_randomize_motions=cfg.training_randomize_motions,
             training_max_num_seqs=cfg.training_max_num_seqs,
+            base_ang_vel_obs_scale=cfg.base_ang_vel_obs_scale,
             enable_domain_randomization=cfg.enable_domain_randomization,
             render_mode=cfg.render_mode,
         )
-        return cls(env, spec=spec)
+        return cls(
+            env,
+            spec=spec,
+            load_robot_spec=cfg.load_robot_spec,
+            assert_spec_consistent=cfg.assert_spec_consistent,
+            base_ang_vel_obs_scale=cfg.base_ang_vel_obs_scale,
+        )
 
     @property
     def step_dt(self) -> float:
@@ -145,34 +217,7 @@ class BFMZeroManagerVectorEnvAdapter:
     def num_actions(self) -> int:
         return self.spec.num_actions
 
-    def assert_order_contract(self) -> None:
-        found_joints = tuple(self.robot.joint_names[index] for index in self.joint_indexes.tolist())
-        found_bodies = tuple(self.robot.body_names[index] for index in self.body_indexes.tolist())
-        if found_joints != self.spec.dof_names:
-            raise AssertionError(f"Manager joint lookup order mismatch: {found_joints} != {self.spec.dof_names}")
-        if found_bodies != self.spec.body_names:
-            raise AssertionError(f"Manager body lookup order mismatch: {found_bodies} != {self.spec.body_names}")
-        total_action_dim = int(getattr(self.unwrapped.action_manager, "total_action_dim", -1))
-        if total_action_dim != self.spec.num_actions:
-            raise AssertionError(f"Manager action dim mismatch: {total_action_dim} != {self.spec.num_actions}")
-        action_term = self.unwrapped.action_manager.get_term("joint_pos")
-        action_joint_names = tuple(getattr(action_term, "_joint_names", ()))
-        if action_joint_names and action_joint_names != self.spec.dof_names:
-            raise AssertionError(f"Manager action joint order mismatch: {action_joint_names} != {self.spec.dof_names}")
-
-    def order_contract(self) -> dict[str, Any]:
-        return {
-            "robot_config": self.spec.config_name,
-            "dof_names": list(self.spec.dof_names),
-            "body_names": list(self.spec.body_names),
-            "motion_body_names": list(self.spec.motion_body_names),
-            "extend_body_names": list(self.spec.extend_body_names),
-            "manager_joint_names": [self.robot.joint_names[index] for index in self.joint_indexes.tolist()],
-            "manager_body_names": [self.robot.body_names[index] for index in self.body_indexes.tolist()],
-            "action_dim": self.num_actions,
-            "enable_domain_randomization": bool(getattr(self.unwrapped, "bfmzero_domain_randomization_enabled", False)),
-        }
-
+    
     def set_is_evaluating(self, *args, **kwargs) -> None:
         del args, kwargs
         self.unwrapped.bfmzero_is_evaluating = True
@@ -196,92 +241,24 @@ class BFMZeroManagerVectorEnvAdapter:
         processed = torch.clamp(processed, -self.spec.action_clip_value, self.spec.action_clip_value)
         return processed
 
-    def _extend_body_tensors(  #[deprecate] self.spec.extend_body_names之后训练不应该加这个
-        self,
-        body_pos: torch.Tensor,
-        body_quat_xyzw: torch.Tensor,
-        body_vel: torch.Tensor,
-        body_ang_vel: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if not self.spec.extend_body_names:
-            return body_pos, body_quat_xyzw, body_vel, body_ang_vel
-
-        extend_pos_values = []
-        extend_quat_values = []
-        extend_vel_values = []
-        extend_ang_vel_values = []
-        body_name_to_index = {name: index for index, name in enumerate(self.spec.body_names)}
-        for parent_name, local_pos, local_rot_wxyz in zip(
-            self.spec.extend_parent_names,
-            self.spec.extend_pos,
-            self.spec.extend_rot_wxyz,
-            strict=True,
-        ):
-            parent_index = body_name_to_index[parent_name]
-            parent_quat = body_quat_xyzw[:, parent_index]
-            local_pos_t = torch.tensor(local_pos, dtype=torch.float32, device=self.device).reshape(1, 3).repeat(self.num_envs, 1)
-            local_rot_xyzw = torch.tensor(
-                [local_rot_wxyz[1], local_rot_wxyz[2], local_rot_wxyz[3], local_rot_wxyz[0]],
-                dtype=torch.float32,
-                device=self.device,
-            ).reshape(1, 4).repeat(self.num_envs, 1)
-            rotated_pos = quat_rotate(parent_quat, local_pos_t, w_last=True)
-            extend_pos = quat_rotate(local_rot_xyzw, rotated_pos, w_last=True) + body_pos[:, parent_index]
-            extend_quat = quat_mul(parent_quat, local_rot_xyzw, w_last=True)
-            extend_ang_vel = body_ang_vel[:, parent_index]
-            angular_velocity_contribution = torch.cross(body_ang_vel[:, parent_index], local_pos_t, dim=1)
-            extend_vel = body_vel[:, parent_index] + angular_velocity_contribution
-            extend_pos_values.append(extend_pos)
-            extend_quat_values.append(extend_quat)
-            extend_vel_values.append(extend_vel)
-            extend_ang_vel_values.append(extend_ang_vel)
-
-        return (
-            torch.cat([body_pos, torch.stack(extend_pos_values, dim=1)], dim=1),
-            torch.cat([body_quat_xyzw, torch.stack(extend_quat_values, dim=1)], dim=1),
-            torch.cat([body_vel, torch.stack(extend_vel_values, dim=1)], dim=1),
-            torch.cat([body_ang_vel, torch.stack(extend_ang_vel_values, dim=1)], dim=1),
-        )
-
     def _compute_terms(self, processed_action: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
-        root_quat_xyzw = wxyz_to_xyzw(self.robot.data.root_quat_w)
-        gravity = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32, device=self.device).reshape(1, 3).repeat(self.num_envs, 1)
-        projected_gravity = quat_rotate_inverse(root_quat_xyzw, gravity, w_last=True) 
-        base_ang_vel = (
-            quat_rotate_inverse(root_quat_xyzw, self.robot.data.root_ang_vel_w, w_last=True)
-            * BFMZERO_BASE_ANG_VEL_OBS_SCALE
+        terms = bfmzero_state_terms(
+            self.unwrapped,
+            self.robot,
+            joint_ids=self.joint_indexes,
+            base_ang_vel_obs_scale=self.base_ang_vel_obs_scale,
         )
-        joint_pos = self.robot.data.joint_pos[:, self.joint_indexes]
-        joint_vel = self.robot.data.joint_vel[:, self.joint_indexes]
-        default_joint_pos = mdp.bfmzero_default_joint_pos(self.unwrapped, self.robot, self.joint_indexes)
-        dof_pos = joint_pos - default_joint_pos
-        body_pos = self.robot.data.body_pos_w[:, self.body_indexes]
-        body_quat_xyzw = wxyz_to_xyzw(self.robot.data.body_quat_w[:, self.body_indexes])
-        body_vel = self.robot.data.body_lin_vel_w[:, self.body_indexes]
-        body_ang_vel = self.robot.data.body_ang_vel_w[:, self.body_indexes]
-        body_pos, body_quat_xyzw, body_vel, body_ang_vel = self._extend_body_tensors(body_pos, body_quat_xyzw, body_vel, body_ang_vel)
-        max_local_self_dict = compute_humanoid_observations_max(
-            body_pos,
-            body_quat_xyzw,
-            body_vel,
-            body_ang_vel,
-            local_root_obs=True,
-            root_height_obs=True,
+        terms.update(
+            bfmzero_privileged_state_terms(
+                self.robot,
+                body_ids=self.body_indexes,
+                root_height_obs=True,
+            )
         )
-        privileged_state = torch.cat([value for value in max_local_self_dict.values()], dim=-1)
         action_obs = self._processed_action_obs(processed_action)
-        terms = {
-            "state": torch.cat([dof_pos, joint_vel, projected_gravity, base_ang_vel], dim=-1),
-            "privileged_state": privileged_state,
-            "last_action": action_obs,
-            "history_actor": self.history.query_actor(),
-            "actions": action_obs,
-            "base_ang_vel": base_ang_vel,
-            "projected_gravity": projected_gravity,
-            "dof_pos": dof_pos,
-            "dof_vel": joint_vel,
-            "joint_pos_abs": joint_pos,
-        }
+        terms["last_action"] = action_obs
+        terms["history_actor"] = self.history.query_actor()
+        terms["actions"] = action_obs
         finite_dict_assert({key: value for key, value in terms.items() if key != "joint_pos_abs"}, context="manager observation")
         return terms
 
@@ -295,18 +272,6 @@ class BFMZeroManagerVectorEnvAdapter:
 
     def get_observation(self) -> dict[str, torch.Tensor]:
         return self._observation_from_terms(self._compute_terms())
-
-    def mujoco_qpos(self) -> torch.Tensor:
-        root_pos = self.robot.data.root_pos_w
-        root_quat_wxyz = self.robot.data.root_quat_w
-        joint_pos = self.robot.data.joint_pos[:, self.joint_indexes]
-        return torch.cat([root_pos, root_quat_wxyz, joint_pos], dim=-1).detach().cpu()
-
-    def mujoco_qvel(self) -> torch.Tensor:
-        root_lin_vel = self.robot.data.root_lin_vel_w
-        root_ang_vel = self.robot.data.root_ang_vel_b
-        joint_vel = self.robot.data.joint_vel[:, self.joint_indexes]
-        return torch.cat([root_lin_vel, root_ang_vel, joint_vel], dim=-1).detach().cpu()
 
     def reset(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         self.unwrapped.reset()
